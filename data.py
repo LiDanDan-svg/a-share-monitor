@@ -1,14 +1,26 @@
+import json
+import os
 import time
 from datetime import datetime, time as dtime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import akshare as ak
 import pandas as pd
+import requests
 
 CN_TZ = ZoneInfo('Asia/Shanghai')
+CACHE_DIR = Path(os.getenv('A_SHARE_CACHE_DIR', '/tmp/a_share_monitor_cache'))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+UA = {
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) '
+                  'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+    'Referer': 'https://gu.qq.com/',
+}
 
 
-def _retry(fn, attempts=2, base_delay=0.8):
+def _retry(fn, attempts=2, base_delay=0.7):
     last = None
     for i in range(attempts):
         try:
@@ -32,6 +44,10 @@ def market_session_status(now=None):
     if dtime(11, 30) < t < dtime(13, 0):
         return '午间休市'
     return '非交易时段'
+
+
+def is_live_session(now=None):
+    return market_session_status(now) == '交易中'
 
 
 def _symbol_with_market(code):
@@ -74,7 +90,6 @@ def normalize_minute(df):
     x = x[need].dropna(subset=['datetime', 'close']).sort_values('datetime').reset_index(drop=True)
     if x.empty:
         return x
-    # 分钟策略只计算最新交易日，避免休市时把多日数据混在同一个 VWAP 中。
     latest_day = x['datetime'].dt.date.max()
     x = x[x['datetime'].dt.date == latest_day].reset_index(drop=True)
     return x
@@ -139,27 +154,128 @@ def fetch_spot():
     return out
 
 
+def _cache_path(code, period):
+    return CACHE_DIR / f'{str(code).zfill(6)}_{period}m.csv'
+
+
+def _save_minute_cache(code, period, df):
+    if df is None or df.empty:
+        return
+    try:
+        df[['datetime', 'open', 'high', 'low', 'close', 'volume']].to_csv(_cache_path(code, period), index=False)
+    except Exception:
+        pass
+
+
+def _load_minute_cache(code, period):
+    p = _cache_path(code, period)
+    if not p.exists():
+        return pd.DataFrame()
+    try:
+        out = normalize_minute(pd.read_csv(p))
+        if not out.empty:
+            out.attrs['source'] = '缓存'
+            out.attrs['cached'] = True
+        return out
+    except Exception:
+        return pd.DataFrame()
+
+
+def _fetch_tencent_minute(code, period='5'):
+    """腾讯财经分钟K线直连接口。
+
+    使用公开网页行情接口作云端备用源，避免 AKShare/东方财富单点失败。
+    返回的典型 K 线字段顺序为：时间、开、收、高、低、量（后面可能还有金额）。
+    """
+    code = str(code).zfill(6)
+    symbol = _symbol_with_market(code)
+    period = str(period)
+    if period not in {'1', '5', '15', '30', '60'}:
+        period = '5'
+    ktype = f'm{period}'
+    url = 'https://web.ifzq.gtimg.cn/appstock/app/kline/mkline'
+    params = {'param': f'{symbol},{ktype},,320'}
+    r = requests.get(url, params=params, headers=UA, timeout=8)
+    r.raise_for_status()
+    text = r.text.strip()
+    # 有些节点返回 JSONP/JS 变量，有些直接返回 JSON；统一截取最外层 JSON。
+    start, end = text.find('{'), text.rfind('}')
+    if start < 0 or end <= start:
+        raise RuntimeError('腾讯返回格式异常')
+    payload = json.loads(text[start:end + 1])
+    data = payload.get('data', {}).get(symbol, {})
+    rows = data.get(ktype) or data.get('m5') or data.get('m1') or []
+    if not rows:
+        raise RuntimeError('腾讯分钟K线为空')
+    parsed = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            continue
+        dt_raw = str(row[0])
+        dt = pd.to_datetime(dt_raw, format='%Y%m%d%H%M', errors='coerce')
+        if pd.isna(dt):
+            dt = pd.to_datetime(dt_raw, errors='coerce')
+        try:
+            # 腾讯 K 线：time, open, close, high, low, volume, ...
+            parsed.append({
+                'datetime': dt,
+                'open': float(row[1]),
+                'close': float(row[2]),
+                'high': float(row[3]),
+                'low': float(row[4]),
+                'volume': float(row[5]),
+            })
+        except Exception:
+            continue
+    return normalize_minute(pd.DataFrame(parsed))
+
+
 def fetch_minute(code, period='5'):
     code = str(code).zfill(6)
+    period = str(period)
     errors = []
+
+    # 1) 东方财富：数据字段最完整，优先使用。
     try:
-        raw = _retry(lambda: ak.stock_zh_a_hist_min_em(symbol=code, period=str(period), adjust=''), attempts=2)
+        raw = _retry(lambda: ak.stock_zh_a_hist_min_em(symbol=code, period=period, adjust=''), attempts=2)
         out = normalize_minute(raw)
         if not out.empty:
             out.attrs['source'] = '东方财富'
+            _save_minute_cache(code, period, out)
             return out
     except Exception as e:
         errors.append(f'东方财富: {e}')
+
+    # 2) 腾讯网页分钟K：直接 HTTP，不依赖 AKShare 的同一底层节点。
+    try:
+        out = _retry(lambda: _fetch_tencent_minute(code, period), attempts=2)
+        if not out.empty:
+            out.attrs['source'] = '腾讯'
+            out.attrs['fallback'] = True
+            _save_minute_cache(code, period, out)
+            return out
+    except Exception as e:
+        errors.append(f'腾讯: {e}')
+
+    # 3) 新浪/AKShare：再做一次独立备用。
     try:
         symbol = _symbol_with_market(code)
-        raw = _retry(lambda: ak.stock_zh_a_minute(symbol=symbol, period=str(period), adjust=''), attempts=2)
+        raw = _retry(lambda: ak.stock_zh_a_minute(symbol=symbol, period=period, adjust=''), attempts=2)
         out = normalize_minute(raw)
         if not out.empty:
             out.attrs['source'] = '新浪'
             out.attrs['fallback'] = True
+            _save_minute_cache(code, period, out)
             return out
     except Exception as e:
         errors.append(f'新浪: {e}')
+
+    # 4) 本次云实例内最后一次成功数据，仅作为复盘/容错，绝不伪装成实时数据。
+    cached = _load_minute_cache(code, period)
+    if not cached.empty:
+        cached.attrs['errors'] = ' | '.join(errors)
+        return cached
+
     raise RuntimeError('；'.join(errors) if errors else '分钟行情为空')
 
 
@@ -207,10 +323,12 @@ def radar_candidates(limit=30, min_amount=1e8):
         return pd.DataFrame()
     x = spot[(spot.price > 0) & (~spot.name.astype(str).str.contains('ST|退|N|C', regex=True, na=False))].copy()
     if 'amount' in x:
-        x = x[x.amount >= min_amount]
+        # 备用行情源可能不提供可靠成交额；若全部为 0，则跳过金额过滤。
+        amt = pd.to_numeric(x['amount'], errors='coerce').fillna(0)
+        if (amt > 0).any():
+            x = x[amt >= min_amount]
     if x.empty:
         return x
-    # 某些备用源没有换手率/成交额时，缺失值按 0 处理，避免整个雷达崩溃。
     for c in ['pct', 'turnover', 'amount']:
         if c not in x.columns:
             x[c] = 0.0
