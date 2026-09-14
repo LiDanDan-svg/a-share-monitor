@@ -1,6 +1,6 @@
 streamlit>=1.50,<2
-akshare>=1.18
 pandas>=2.2
 numpy>=1.26
 requests>=2.32
+tushare>=1.4.24
 plotly>=5.24

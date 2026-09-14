@@ -1,35 +1,53 @@
 import json
 import os
 import time
+import uuid
 from datetime import datetime, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import akshare as ak
 import pandas as pd
 import requests
 
+try:
+    import tushare as ts
+except Exception:
+    ts = None
+
 CN_TZ = ZoneInfo('Asia/Shanghai')
-CACHE_DIR = Path(os.getenv('A_SHARE_CACHE_DIR', '/tmp/a_share_monitor_cache'))
+CACHE_DIR = Path(os.getenv('A_SHARE_CACHE_DIR', '/tmp/a_share_monitor_cache_v221'))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-UA = {
-    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) '
-                  'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
-    'Referer': 'https://gu.qq.com/',
+_CONFIG = {
+    'minute_provider': 'auto',
+    'market_provider': 'auto',
+    'alltick_token': '',
+    'tushare_token': '',
+    'alltick_interval': 1.05,
 }
+_LAST_ALLTICK_CALL = 0.0
+_TUSHARE_PRO = None
 
 
-def _retry(fn, attempts=2, base_delay=0.7):
-    last = None
-    for i in range(attempts):
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            if i < attempts - 1:
-                time.sleep(base_delay * (i + 1))
-    raise last
+def configure(minute_provider='auto', market_provider='auto', alltick_token='', tushare_token='', alltick_interval=1.05):
+    global _TUSHARE_PRO
+    _CONFIG.update({
+        'minute_provider': str(minute_provider or 'auto').lower(),
+        'market_provider': str(market_provider or 'auto').lower(),
+        'alltick_token': str(alltick_token or '').strip(),
+        'tushare_token': str(tushare_token or '').strip(),
+        'alltick_interval': max(0.05, float(alltick_interval or 1.05)),
+    })
+    _TUSHARE_PRO = None
+
+
+def provider_summary():
+    return {
+        'minute_provider': _resolve_provider(_CONFIG['minute_provider'], purpose='minute'),
+        'market_provider': _resolve_provider(_CONFIG['market_provider'], purpose='market'),
+        'alltick_configured': bool(_CONFIG['alltick_token']),
+        'tushare_configured': bool(_CONFIG['tushare_token']),
+    }
 
 
 def market_session_status(now=None):
@@ -50,294 +68,341 @@ def is_live_session(now=None):
     return market_session_status(now) == '交易中'
 
 
-def _symbol_with_market(code):
-    code = str(code).zfill(6)
-    if code.startswith(('6', '68')):
-        return 'sh' + code
-    if code.startswith(('0', '2', '3')):
-        return 'sz' + code
+def code_to_ts(code):
+    code = str(code).strip().split('.')[0].zfill(6)
     if code.startswith(('4', '8', '9')):
-        return 'bj' + code
-    return 'sz' + code
+        return f'{code}.BJ'
+    if code.startswith('6'):
+        return f'{code}.SH'
+    return f'{code}.SZ'
 
 
-def normalize_minute(df):
-    if df is None or df.empty:
-        return pd.DataFrame()
+def normalize_minute(df, keep_days=3):
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=['datetime', 'open', 'high', 'low', 'close', 'volume', 'amount'])
     x = df.copy()
-    mp = {}
-    for c in x.columns:
-        s = str(c).strip().lower()
-        if s in ['时间', '日期', 'datetime', 'time', 'date', 'day']:
-            mp[c] = 'datetime'
-        elif s in ['开盘', 'open']:
-            mp[c] = 'open'
-        elif s in ['最高', 'high']:
-            mp[c] = 'high'
-        elif s in ['最低', 'low']:
-            mp[c] = 'low'
-        elif s in ['收盘', 'close']:
-            mp[c] = 'close'
-        elif s in ['成交量', 'volume', 'vol']:
-            mp[c] = 'volume'
-    x = x.rename(columns=mp)
-    need = ['datetime', 'open', 'high', 'low', 'close', 'volume']
-    if not all(c in x.columns for c in need):
-        return pd.DataFrame()
-    x['datetime'] = pd.to_datetime(x['datetime'], errors='coerce')
-    for c in need[1:]:
-        x[c] = pd.to_numeric(x[c], errors='coerce')
-    x = x[need].dropna(subset=['datetime', 'close']).sort_values('datetime').reset_index(drop=True)
-    if x.empty:
-        return x
-    latest_day = x['datetime'].dt.date.max()
-    x = x[x['datetime'].dt.date == latest_day].reset_index(drop=True)
-    return x
-
-
-def _normalize_spot(x, source):
-    if x is None or x.empty:
-        return pd.DataFrame()
-    x = x.copy()
     rename = {}
     for c in x.columns:
-        s = str(c).strip()
-        sl = s.lower()
-        if s in ['代码', '证券代码'] or sl in ['code', 'symbol']:
-            rename[c] = 'code'
-        elif s in ['名称', '证券名称'] or sl == 'name':
-            rename[c] = 'name'
-        elif s in ['最新价', '现价', '最新'] or sl in ['trade', 'price', 'close']:
-            rename[c] = 'price'
-        elif s == '涨跌幅' or sl in ['percent', 'pct', 'changepercent']:
-            rename[c] = 'pct'
-        elif s == '成交量' or sl in ['volume', 'vol']:
+        s = str(c).strip().lower()
+        if s in ['时间', '日期', 'datetime', 'time', 'date', 'day', 'trade_time']:
+            rename[c] = 'datetime'
+        elif s in ['开盘', 'open', 'open_price']:
+            rename[c] = 'open'
+        elif s in ['最高', 'high', 'high_price']:
+            rename[c] = 'high'
+        elif s in ['最低', 'low', 'low_price']:
+            rename[c] = 'low'
+        elif s in ['收盘', 'close', 'close_price']:
+            rename[c] = 'close'
+        elif s in ['成交量', 'volume', 'vol']:
             rename[c] = 'volume'
-        elif s == '成交额' or sl in ['amount', 'turnover_amount']:
+        elif s in ['成交额', 'amount', 'turnover']:
             rename[c] = 'amount'
-        elif s == '换手率' or sl in ['turnoverratio', 'turnover_rate']:
-            rename[c] = 'turnover'
     x = x.rename(columns=rename)
-    if 'code' not in x.columns:
-        return pd.DataFrame()
-    if 'name' not in x.columns:
-        x['name'] = ''
-    for c in ['price', 'pct', 'volume', 'amount', 'turnover']:
-        if c not in x.columns:
-            x[c] = 0.0
+    need = ['datetime', 'open', 'high', 'low', 'close', 'volume']
+    if not all(c in x.columns for c in need):
+        return pd.DataFrame(columns=need + ['amount'])
+    if 'amount' not in x.columns:
+        x['amount'] = 0.0
+    # Unix timestamps from AllTick are seconds. String timestamps from Tushare parse directly.
+    if pd.api.types.is_numeric_dtype(x['datetime']):
+        x['datetime'] = pd.to_datetime(x['datetime'], unit='s', utc=True, errors='coerce').dt.tz_convert(CN_TZ).dt.tz_localize(None)
+    else:
+        raw = x['datetime'].astype(str)
+        numeric_mask = raw.str.fullmatch(r'\d{10,13}', na=False)
+        parsed = pd.to_datetime(raw, errors='coerce')
+        if numeric_mask.any():
+            nums = pd.to_numeric(raw[numeric_mask], errors='coerce')
+            unit = 'ms' if nums.dropna().astype(str).str.len().max() and nums.dropna().astype(str).str.len().max() >= 13 else 's'
+            p2 = pd.to_datetime(nums, unit=unit, utc=True, errors='coerce').dt.tz_convert(CN_TZ).dt.tz_localize(None)
+            parsed.loc[numeric_mask] = p2.values
+        x['datetime'] = parsed
+    for c in ['open', 'high', 'low', 'close', 'volume', 'amount']:
         x[c] = pd.to_numeric(x[c], errors='coerce')
-    x['code'] = x['code'].astype(str).str.extract(r'(\d{6})', expand=False).fillna(x['code'].astype(str)).str.zfill(6)
-    x.attrs['source'] = source
-    return x
-
-
-def fetch_spot():
-    errors = []
-    try:
-        x = _retry(lambda: ak.stock_zh_a_spot_em(), attempts=2)
-        out = _normalize_spot(x, '东方财富')
-        if not out.empty:
-            return out
-    except Exception as e:
-        errors.append(f'东方财富: {e}')
-    try:
-        x = _retry(lambda: ak.stock_zh_a_spot(), attempts=2)
-        out = _normalize_spot(x, '新浪')
-        if not out.empty:
-            out.attrs['fallback'] = True
-            return out
-    except Exception as e:
-        errors.append(f'新浪: {e}')
-    out = pd.DataFrame()
-    out.attrs['source'] = '不可用'
-    out.attrs['error'] = ' | '.join(errors)
-    return out
+    x = x[['datetime', 'open', 'high', 'low', 'close', 'volume', 'amount']].dropna(subset=['datetime', 'close'])
+    x = x.sort_values('datetime').drop_duplicates('datetime', keep='last').reset_index(drop=True)
+    if x.empty:
+        return x
+    days = sorted(x['datetime'].dt.date.unique())[-max(1, int(keep_days)):]
+    return x[x['datetime'].dt.date.isin(days)].reset_index(drop=True)
 
 
 def _cache_path(code, period):
     return CACHE_DIR / f'{str(code).zfill(6)}_{period}m.csv'
 
 
-def _save_minute_cache(code, period, df):
+def _save_cache(code, period, df):
     if df is None or df.empty:
         return
     try:
-        df[['datetime', 'open', 'high', 'low', 'close', 'volume']].to_csv(_cache_path(code, period), index=False)
+        df.to_csv(_cache_path(code, period), index=False)
     except Exception:
         pass
 
 
-def _load_minute_cache(code, period):
+def _load_cache(code, period):
     p = _cache_path(code, period)
     if not p.exists():
         return pd.DataFrame()
     try:
         out = normalize_minute(pd.read_csv(p))
         if not out.empty:
-            out.attrs['source'] = '缓存'
+            out.attrs['source'] = '云端缓存'
             out.attrs['cached'] = True
         return out
     except Exception:
         return pd.DataFrame()
 
 
-def _fetch_tencent_minute(code, period='5'):
-    """腾讯财经分钟K线直连接口。
+def _resolve_provider(requested, purpose='minute'):
+    requested = str(requested or 'auto').lower()
+    if requested in ('alltick', 'tushare'):
+        return requested
+    # auto: AllTick优先做分钟，Tushare优先做全市场截面。
+    if purpose == 'market':
+        if _CONFIG['tushare_token']:
+            return 'tushare'
+        if _CONFIG['alltick_token']:
+            return 'alltick'
+    else:
+        if _CONFIG['alltick_token']:
+            return 'alltick'
+        if _CONFIG['tushare_token']:
+            return 'tushare'
+    return 'none'
 
-    使用公开网页行情接口作云端备用源，避免 AKShare/东方财富单点失败。
-    返回的典型 K 线字段顺序为：时间、开、收、高、低、量（后面可能还有金额）。
-    """
-    code = str(code).zfill(6)
-    symbol = _symbol_with_market(code)
-    period = str(period)
-    if period not in {'1', '5', '15', '30', '60'}:
-        period = '5'
-    ktype = f'm{period}'
-    url = 'https://web.ifzq.gtimg.cn/appstock/app/kline/mkline'
-    params = {'param': f'{symbol},{ktype},,320'}
-    r = requests.get(url, params=params, headers=UA, timeout=8)
+
+def _alltick_wait():
+    global _LAST_ALLTICK_CALL
+    gap = _CONFIG['alltick_interval']
+    elapsed = time.monotonic() - _LAST_ALLTICK_CALL
+    if _LAST_ALLTICK_CALL and elapsed < gap:
+        time.sleep(gap - elapsed)
+    _LAST_ALLTICK_CALL = time.monotonic()
+
+
+def _alltick_get(path, query):
+    token = _CONFIG['alltick_token']
+    if not token:
+        raise RuntimeError('未配置 AllTick Token')
+    _alltick_wait()
+    url = f'https://quote.alltick.co/quote-stock-b-api/{path}'
+    r = requests.get(url, params={'token': token, 'query': json.dumps(query, ensure_ascii=False, separators=(',', ':'))}, timeout=15)
     r.raise_for_status()
-    text = r.text.strip()
-    # 有些节点返回 JSONP/JS 变量，有些直接返回 JSON；统一截取最外层 JSON。
-    start, end = text.find('{'), text.rfind('}')
-    if start < 0 or end <= start:
-        raise RuntimeError('腾讯返回格式异常')
-    payload = json.loads(text[start:end + 1])
-    data = payload.get('data', {}).get(symbol, {})
-    rows = data.get(ktype) or data.get('m5') or data.get('m1') or []
-    if not rows:
-        raise RuntimeError('腾讯分钟K线为空')
-    parsed = []
-    for row in rows:
-        if not isinstance(row, (list, tuple)) or len(row) < 6:
-            continue
-        dt_raw = str(row[0])
-        dt = pd.to_datetime(dt_raw, format='%Y%m%d%H%M', errors='coerce')
-        if pd.isna(dt):
-            dt = pd.to_datetime(dt_raw, errors='coerce')
-        try:
-            # 腾讯 K 线：time, open, close, high, low, volume, ...
-            parsed.append({
-                'datetime': dt,
-                'open': float(row[1]),
-                'close': float(row[2]),
-                'high': float(row[3]),
-                'low': float(row[4]),
-                'volume': float(row[5]),
-            })
-        except Exception:
-            continue
-    return normalize_minute(pd.DataFrame(parsed))
+    payload = r.json()
+    if int(payload.get('ret', -1)) != 200:
+        raise RuntimeError(f"AllTick {payload.get('ret')}: {payload.get('msg', '请求失败')}")
+    return payload
 
 
-def fetch_minute(code, period='5'):
-    code = str(code).zfill(6)
+def _alltick_post_batch(data_list):
+    token = _CONFIG['alltick_token']
+    if not token:
+        raise RuntimeError('未配置 AllTick Token')
+    _alltick_wait()
+    url = 'https://quote.alltick.co/quote-stock-b-api/batch-kline'
+    body = {'trace': uuid.uuid4().hex, 'data': {'data_list': data_list}}
+    r = requests.post(url, params={'token': token}, json=body, timeout=15)
+    r.raise_for_status()
+    payload = r.json()
+    if int(payload.get('ret', -1)) != 200:
+        raise RuntimeError(f"AllTick {payload.get('ret')}: {payload.get('msg', '请求失败')}")
+    return payload
+
+
+def _fetch_alltick_minute(code, period='1'):
     period = str(period)
+    ktype = {'1': 1, '5': 2, '15': 3, '30': 4, '60': 5}.get(period, 1)
+    q = {
+        'trace': uuid.uuid4().hex,
+        'data': {
+            'code': code_to_ts(code),
+            'kline_type': ktype,
+            'kline_timestamp_end': 0,
+            'query_kline_num': 160,
+            'adjust_type': 0,
+        },
+    }
+    payload = _alltick_get('kline', q)
+    data = payload.get('data') or {}
+    rows = data.get('kline_list') or data.get('kline_data') or []
+    out = normalize_minute(pd.DataFrame(rows), keep_days=3)
+    if out.empty:
+        raise RuntimeError('AllTick 返回的分钟K线为空；请确认套餐已包含该A股代码')
+    out.attrs['source'] = 'AllTick'
+    return out
+
+
+def _tushare_pro():
+    global _TUSHARE_PRO
+    token = _CONFIG['tushare_token']
+    if not token:
+        raise RuntimeError('未配置 Tushare Token')
+    if ts is None:
+        raise RuntimeError('未安装 tushare，请检查 requirements.txt')
+    if _TUSHARE_PRO is None:
+        _TUSHARE_PRO = ts.pro_api(token)
+    return _TUSHARE_PRO
+
+
+def _fetch_tushare_minute(code, period='1'):
+    pro = _tushare_pro()
+    freq = f'{str(period).upper()}MIN'
+    raw = pro.rt_min_daily(freq=freq, ts_code=code_to_ts(code))
+    out = normalize_minute(raw, keep_days=1)
+    if out.empty:
+        raise RuntimeError('Tushare 实时分钟为空；休市时可能无当日累计数据，或账号未开通实时分钟权限')
+    out.attrs['source'] = 'Tushare实时分钟'
+    return out
+
+
+def fetch_minute(code, period='1'):
+    code = str(code).split('.')[0].zfill(6)
+    first = _resolve_provider(_CONFIG['minute_provider'], purpose='minute')
+    order = [first]
+    if first == 'alltick' and _CONFIG['tushare_token']:
+        order.append('tushare')
+    elif first == 'tushare' and _CONFIG['alltick_token']:
+        order.append('alltick')
     errors = []
-
-    # 1) 东方财富：数据字段最完整，优先使用。
-    try:
-        raw = _retry(lambda: ak.stock_zh_a_hist_min_em(symbol=code, period=period, adjust=''), attempts=2)
-        out = normalize_minute(raw)
-        if not out.empty:
-            out.attrs['source'] = '东方财富'
-            _save_minute_cache(code, period, out)
+    for provider in order:
+        try:
+            out = _fetch_alltick_minute(code, period) if provider == 'alltick' else _fetch_tushare_minute(code, period)
+            _save_cache(code, period, out)
             return out
-    except Exception as e:
-        errors.append(f'东方财富: {e}')
-
-    # 2) 腾讯网页分钟K：直接 HTTP，不依赖 AKShare 的同一底层节点。
-    try:
-        out = _retry(lambda: _fetch_tencent_minute(code, period), attempts=2)
-        if not out.empty:
-            out.attrs['source'] = '腾讯'
-            out.attrs['fallback'] = True
-            _save_minute_cache(code, period, out)
-            return out
-    except Exception as e:
-        errors.append(f'腾讯: {e}')
-
-    # 3) 新浪/AKShare：再做一次独立备用。
-    try:
-        symbol = _symbol_with_market(code)
-        raw = _retry(lambda: ak.stock_zh_a_minute(symbol=symbol, period=period, adjust=''), attempts=2)
-        out = normalize_minute(raw)
-        if not out.empty:
-            out.attrs['source'] = '新浪'
-            out.attrs['fallback'] = True
-            _save_minute_cache(code, period, out)
-            return out
-    except Exception as e:
-        errors.append(f'新浪: {e}')
-
-    # 4) 本次云实例内最后一次成功数据，仅作为复盘/容错，绝不伪装成实时数据。
-    cached = _load_minute_cache(code, period)
+        except Exception as e:
+            errors.append(f'{provider}: {e}')
+    cached = _load_cache(code, period)
     if not cached.empty:
         cached.attrs['errors'] = ' | '.join(errors)
         return cached
+    if first == 'none':
+        raise RuntimeError('尚未配置稳定行情API Token。请先配置 AllTick 或 Tushare。')
+    raise RuntimeError('；'.join(errors))
 
-    raise RuntimeError('；'.join(errors) if errors else '分钟行情为空')
+
+def _fetch_tushare_market_snapshot():
+    pro = _tushare_pro()
+    raw = pro.rt_k(ts_code='0*.SZ,3*.SZ,6*.SH,4*.BJ,8*.BJ,9*.BJ')
+    if raw is None or raw.empty:
+        raise RuntimeError('Tushare rt_k 返回空数据')
+    x = raw.copy()
+    x['code'] = x['ts_code'].astype(str).str.extract(r'(\d{6})', expand=False)
+    x['name'] = x.get('name', '')
+    x['price'] = pd.to_numeric(x.get('close'), errors='coerce')
+    x['pre_close'] = pd.to_numeric(x.get('pre_close'), errors='coerce')
+    x['pct'] = (x['price'] / x['pre_close'] - 1) * 100
+    x['volume'] = pd.to_numeric(x.get('vol', 0), errors='coerce').fillna(0)
+    x['amount'] = pd.to_numeric(x.get('amount', 0), errors='coerce').fillna(0)
+    x['turnover'] = 0.0
+    x = x[['code', 'name', 'price', 'pre_close', 'pct', 'volume', 'amount', 'turnover']].dropna(subset=['code', 'price'])
+    x.attrs['source'] = 'Tushare实时日线'
+    return x
 
 
-def fetch_index_spot():
-    try:
-        x = _retry(lambda: ak.stock_zh_index_spot_em(symbol='沪深重要指数'), attempts=2)
-        if x is None or x.empty:
-            return pd.DataFrame()
-        for c in ['最新价', '涨跌幅', '成交额', '成交量']:
-            if c in x.columns:
-                x[c] = pd.to_numeric(x[c], errors='coerce')
-        x.attrs['source'] = '东方财富'
-        return x
-    except Exception:
-        return pd.DataFrame()
+def _alltick_index_returns():
+    # AllTick基础版/以上可把两个大盘指数加入产品篮子；免费版也包含演示指数。
+    items = []
+    for code, name in [('000001.SH', '上证指数'), ('399001.SZ', '深证成指')]:
+        q = {
+            'trace': uuid.uuid4().hex,
+            'data': {'code': code, 'kline_type': 8, 'kline_timestamp_end': 0, 'query_kline_num': 2, 'adjust_type': 0},
+        }
+        p = _alltick_get('kline', q)
+        rows = (p.get('data') or {}).get('kline_list') or []
+        if len(rows) >= 2:
+            rows = sorted(rows, key=lambda r: int(r.get('timestamp', 0)))
+            prev = float(rows[-2]['close_price'])
+            cur = float(rows[-1]['close_price'])
+            items.append({'name': name, 'pct': (cur / prev - 1) * 100, 'price': cur})
+    return pd.DataFrame(items)
 
 
 def market_regime():
-    spot = fetch_spot()
     status = market_session_status()
-    source = spot.attrs.get('source', '未知')
-    error = spot.attrs.get('error', '')
-    if spot.empty or 'pct' not in spot:
-        return {
-            'score': 50, 'label': '行情源不可用', 'breadth': 0, 'avg_pct': 0,
-            'top': pd.DataFrame(), 'source': source, 'status': status, 'error': error,
-        }
-    valid = spot[(spot.price > 0) & (~spot.name.astype(str).str.contains('ST|退', regex=True, na=False))]
-    breadth = float((valid.pct > 0).mean() * 100) if len(valid) else 50
-    avg = float(valid.pct.mean()) if len(valid) else 0
-    limit_up = float((valid.pct >= 9.5).mean() * 100) if len(valid) else 0
-    score = 50 + (breadth - 50) * 0.45 + avg * 4 + limit_up * 1.5
-    score = max(0, min(100, score))
-    label = '强势' if score >= 70 else '偏强' if score >= 58 else '震荡' if score >= 42 else '偏弱' if score >= 30 else '弱势'
-    top = valid.sort_values('pct', ascending=False).head(10)[['code', 'name', 'pct', 'amount']]
-    return {
-        'score': round(score, 1), 'label': label, 'breadth': round(breadth, 1),
-        'avg_pct': round(avg, 2), 'top': top, 'source': source, 'status': status, 'error': error,
-    }
+    provider = _resolve_provider(_CONFIG['market_provider'], purpose='market')
+    if provider == 'none':
+        return {'score': 50, 'label': '等待API配置', 'breadth': None, 'avg_pct': 0.0, 'top': pd.DataFrame(), 'source': '未配置', 'status': status, 'error': ''}
+    if provider == 'tushare':
+        try:
+            spot = _fetch_tushare_market_snapshot()
+            valid = spot[(spot.price > 0) & (~spot.name.astype(str).str.contains('ST|退', regex=True, na=False))].copy()
+            breadth = float((valid.pct > 0).mean() * 100) if len(valid) else 50.0
+            avg = float(valid.pct.mean()) if len(valid) else 0.0
+            limit_up = float((valid.pct >= 9.5).mean() * 100) if len(valid) else 0.0
+            score = max(0, min(100, 50 + (breadth - 50) * 0.45 + avg * 4 + limit_up * 1.5))
+            label = '强势' if score >= 70 else '偏强' if score >= 58 else '震荡' if score >= 42 else '偏弱' if score >= 30 else '弱势'
+            top = valid.sort_values('pct', ascending=False).head(10)[['code', 'name', 'pct', 'amount']]
+            return {'score': round(score, 1), 'label': label, 'breadth': round(breadth, 1), 'avg_pct': round(avg, 2), 'top': top, 'source': spot.attrs.get('source'), 'status': status, 'error': ''}
+        except Exception as e:
+            # 如果同时配置AllTick，用指数环境继续运行。
+            if _CONFIG['alltick_token']:
+                provider = 'alltick'
+            else:
+                return {'score': 50, 'label': '市场API不可用', 'breadth': None, 'avg_pct': 0.0, 'top': pd.DataFrame(), 'source': 'Tushare', 'status': status, 'error': str(e)}
+    if provider == 'alltick':
+        try:
+            idx = _alltick_index_returns()
+            if idx.empty:
+                raise RuntimeError('指数数据为空')
+            avg = float(idx['pct'].mean())
+            score = max(0, min(100, 50 + avg * 8))
+            label = '强势' if score >= 70 else '偏强' if score >= 58 else '震荡' if score >= 42 else '偏弱' if score >= 30 else '弱势'
+            top = idx.rename(columns={'name': 'code'})[['code', 'pct']].copy()
+            return {'score': round(score, 1), 'label': f'{label}·指数', 'breadth': None, 'avg_pct': round(avg, 2), 'top': top, 'source': 'AllTick大盘指数', 'status': status, 'error': ''}
+        except Exception as e:
+            return {'score': 50, 'label': '指数API不可用', 'breadth': None, 'avg_pct': 0.0, 'top': pd.DataFrame(), 'source': 'AllTick', 'status': status, 'error': str(e)}
 
 
 def radar_candidates(limit=30, min_amount=1e8):
-    spot = fetch_spot()
-    if spot.empty:
-        return pd.DataFrame()
-    x = spot[(spot.price > 0) & (~spot.name.astype(str).str.contains('ST|退|N|C', regex=True, na=False))].copy()
-    if 'amount' in x:
-        # 备用行情源可能不提供可靠成交额；若全部为 0，则跳过金额过滤。
-        amt = pd.to_numeric(x['amount'], errors='coerce').fillna(0)
-        if (amt > 0).any():
-            x = x[amt >= min_amount]
+    """稳定全市场雷达需要 Tushare 实时日线权限。
+
+    AllTick基础/高级套餐是自选产品篮子，不应伪装成全市场扫描；因此没有Tushare市场权限时返回空表。
+    """
+    if not _CONFIG['tushare_token']:
+        out = pd.DataFrame()
+        out.attrs['error'] = '全市场雷达需要 Tushare 实时日线权限；AllTick 普通套餐仅扫描已订阅产品。'
+        return out
+    try:
+        x = _fetch_tushare_market_snapshot()
+    except Exception as e:
+        out = pd.DataFrame()
+        out.attrs['error'] = str(e)
+        return out
+    x = x[(x.price > 0) & (~x.name.astype(str).str.contains('ST|退|N|C', regex=True, na=False))].copy()
+    x = x[pd.to_numeric(x['amount'], errors='coerce').fillna(0) >= float(min_amount)]
     if x.empty:
         return x
-    for c in ['pct', 'turnover', 'amount']:
-        if c not in x.columns:
-            x[c] = 0.0
-        x[c] = pd.to_numeric(x[c], errors='coerce').fillna(0)
-    x['radar_rank'] = (
-        x.pct.rank(pct=True) * 45
-        + x.turnover.rank(pct=True) * 20
-        + x.amount.rank(pct=True) * 20
-        + x.pct.clip(lower=0).rank(pct=True) * 15
-    )
-    x.attrs['source'] = spot.attrs.get('source', '未知')
-    return x.sort_values('radar_rank', ascending=False).head(limit).reset_index(drop=True)
+    x['pct'] = pd.to_numeric(x['pct'], errors='coerce').fillna(0)
+    x['amount'] = pd.to_numeric(x['amount'], errors='coerce').fillna(0)
+    x['radar_rank'] = x['pct'].rank(pct=True) * 60 + x['amount'].rank(pct=True) * 40
+    x.attrs['source'] = 'Tushare实时日线'
+    return x.sort_values('radar_rank', ascending=False).head(int(limit)).reset_index(drop=True)
+
+
+def diagnose(sample_code='600519', period='1'):
+    rows = []
+    if _CONFIG['alltick_token']:
+        try:
+            df = _fetch_alltick_minute(sample_code, period)
+            rows.append({'服务': 'AllTick分钟K', '状态': '✅ 正常', '详情': f'{len(df)}根；最新 {df.datetime.max()}'} )
+        except Exception as e:
+            rows.append({'服务': 'AllTick分钟K', '状态': '❌ 失败', '详情': str(e)})
+    else:
+        rows.append({'服务': 'AllTick分钟K', '状态': '未配置', '详情': '需要 ALLTICK_TOKEN'})
+    if _CONFIG['tushare_token']:
+        try:
+            pro = _tushare_pro()
+            q = pro.rt_k(ts_code=code_to_ts(sample_code))
+            rows.append({'服务': 'Tushare实时日线', '状态': '✅ 正常' if q is not None and not q.empty else '⚠️ 空数据', '详情': f'{0 if q is None else len(q)}行'})
+        except Exception as e:
+            rows.append({'服务': 'Tushare实时日线', '状态': '❌ 失败', '详情': str(e)})
+        try:
+            df = _fetch_tushare_minute(sample_code, period)
+            rows.append({'服务': 'Tushare实时分钟', '状态': '✅ 正常', '详情': f'{len(df)}根；最新 {df.datetime.max()}'} )
+        except Exception as e:
+            rows.append({'服务': 'Tushare实时分钟', '状态': '❌ 失败', '详情': str(e)})
+    else:
+        rows.append({'服务': 'Tushare实时日线', '状态': '未配置', '详情': '需要 TUSHARE_TOKEN + 对应权限'})
+        rows.append({'服务': 'Tushare实时分钟', '状态': '未配置', '详情': '需要 TUSHARE_TOKEN + 实时分钟权限'})
+    return pd.DataFrame(rows)
