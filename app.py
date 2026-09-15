@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from alerts import send_pushplus, send_serverchan
 from backtest_v250 import backtest
@@ -30,7 +31,7 @@ from portfolio_store import (
     save_runtime_snapshot, snapshot_json, unpack_snapshot,
 )
 
-APP_VERSION = '2.5.0'
+APP_VERSION = '2.5.1'
 WATCHLIST_FILE = Path(__file__).with_name('watchlist.json')
 
 st.set_page_config(
@@ -108,6 +109,12 @@ if 'notification_last' not in st.session_state:
     st.session_state.notification_last = {}
 if 'notification_log' not in st.session_state:
     st.session_state.notification_log = []
+if '_last_auto_scan_epoch' not in st.session_state:
+    st.session_state._last_auto_scan_epoch = 0.0
+if '_last_auto_scan_cn' not in st.session_state:
+    st.session_state._last_auto_scan_cn = ''
+if '_auto_scan_count' not in st.session_state:
+    st.session_state._auto_scan_count = 0
 if '_pending_widget_sync' not in st.session_state:
     st.session_state._pending_widget_sync = {}
 if st.session_state.get('_app_version') != APP_VERSION:
@@ -304,7 +311,7 @@ def maybe_auto_notify(code, sig, qty, when, enabled, cooldown_minutes, pp_token,
     return '；'.join(results)
 
 st.title(f'📈 A股主升浪雷达 V{APP_VERSION}')
-st.caption('真实历史验证版｜训练/验证/测试三段隔离｜优化Profit Factor与平均盈亏比｜保留实盘联调与手机推送｜不自动下单')
+st.caption('自动循环扫描版｜交易时段按间隔自动扫描自选股并推送有效信号｜保留V2.5样本外验证｜不自动下单')
 st.caption(f'策略内核：{ENGINE_BUILD}｜卖出数量按计划比例向下取整到100股整数手')
 
 with st.sidebar:
@@ -390,8 +397,12 @@ with st.sidebar:
     period = st.selectbox('分钟级别', ['1', '5', '15'], index=0)
     radar_n = st.slider('全市场雷达候选数', 5, 50, 20, 5)
     min_amount = st.number_input('雷达最低成交额（元）', 0, 10_000_000_000, 100_000_000, 10_000_000)
-    auto = st.checkbox('开启自动刷新', False)
-    refresh = st.slider('刷新秒数', 30, 300, 60, 10)
+    auto = st.checkbox(
+        '开启自动循环扫描（页面保持打开）', False,
+        help='连续竞价时段按设定间隔自动扫描自选股；午休保持定时刷新但不发交易信号。关闭浏览器页面、手机进入深度后台或云端休眠时，循环可能暂停。',
+    )
+    refresh = st.slider('自动扫描间隔（秒）', 30, 300, 60, 10)
+    st.caption('建议9只股票先用60秒。1分钟K没有必要高频重复请求。')
 
     st.divider()
     st.subheader('🎯 V2.5 策略参数')
@@ -523,14 +534,33 @@ if live_mode:
 else:
     st.info('🕒 非连续竞价时段：页面只做复盘/连通性检查，不把旧K线当成正在发生的买卖信号。')
 
+# V2.5.1 自动扫描调度：任何普通控件 rerun 都不会重复请求，只有达到扫描间隔才触发。
+_now_epoch = time.time()
+_last_auto = float(st.session_state.get('_last_auto_scan_epoch', 0.0) or 0.0)
+_auto_due = bool(
+    auto and live_mode and summary['watchlist_scan_enabled'] and codes
+    and (_now_epoch - _last_auto >= max(10, int(refresh) - 2))
+)
+_do_watch_scan = bool(scan or _auto_due)
+
+if auto:
+    if not summary['watchlist_scan_enabled']:
+        st.warning('⏸️ 自动循环扫描已开启，但当前行情权限不允许扫描自选股。Trial模式不会请求自选A股分钟K。')
+    elif live_mode:
+        last_txt = st.session_state.get('_last_auto_scan_cn') or '尚未自动扫描'
+        st.info(f'🤖 自动循环扫描运行中｜间隔 {refresh} 秒｜上次自动扫描：{last_txt}｜累计 {st.session_state.get("_auto_scan_count", 0)} 轮')
+    else:
+        st.info('⏸️ 自动循环扫描已开启，但当前不在连续竞价时段；交易时段会自动恢复。')
+
 st.subheader('⭐ 自选股信号')
 if not codes:
     st.info('请先在左侧“自选股管理”添加股票。')
 elif not summary['watchlist_scan_enabled']:
     st.info('🔒 当前未开放自选股分钟扫描。Trial 只验证指数；确认套餐权限后可在左侧把运行模式切到 paid。')
     st.session_state.pop('results', None)
-elif scan:
+elif _do_watch_scan:
     rows = []
+    _scan_started_cn = china_now().strftime('%Y-%m-%d %H:%M:%S')
     prog = st.progress(0)
     for i, code in enumerate(codes):
         try:
@@ -599,6 +629,14 @@ elif scan:
             rows.append({'代码': code, '操作': '数据失败', '原因': friendly_error(e)})
         prog.progress((i + 1) / max(1, len(codes)))
     st.session_state.results = pd.DataFrame(rows)
+    if _auto_due:
+        st.session_state._last_auto_scan_epoch = time.time()
+        st.session_state._last_auto_scan_cn = china_now().strftime('%Y-%m-%d %H:%M:%S')
+        st.session_state._auto_scan_count = int(st.session_state.get('_auto_scan_count', 0)) + 1
+    elif scan:
+        # 手动扫描也更新最近扫描时间，避免紧接着又被自动循环重复请求。
+        st.session_state._last_auto_scan_epoch = time.time()
+        st.session_state._last_auto_scan_cn = china_now().strftime('%Y-%m-%d %H:%M:%S')
     _save_runtime_state()
 
 res = st.session_state.get('results', pd.DataFrame())
@@ -606,7 +644,7 @@ if summary['watchlist_scan_enabled']:
     if not res.empty:
         st.dataframe(res, use_container_width=True, hide_index=True)
     else:
-        st.info('点击左侧“立即扫描自选股”后开始获取分钟行情。API缓存会避免短时间重复消耗额度。')
+        st.info('可点击左侧“立即扫描自选股”，或开启“自动循环扫描”。API缓存与扫描间隔会避免短时间重复消耗额度。')
 
 st.subheader('🔥 主升浪雷达')
 with st.expander('稳定全市场扫描', expanded=True):
@@ -741,7 +779,7 @@ else:
 
 if codes:
     st.markdown('#### 🧭 状态机手动登记')
-    st.caption('只有实际成交后才确认。V2.5.0确认成交会自动同步总持仓、成本、T+1可卖和待接回，不再要求你手工二次修改持仓。')
+    st.caption('只有实际成交后才确认。V2.5.1确认成交会自动同步总持仓、成本、T+1可卖和待接回，不再要求你手工二次修改持仓。')
     exec_code = st.selectbox('登记股票', codes, key='exec_code')
     last_sig = st.session_state.last_analysis.get(exec_code)
     state = get_trade_state(exec_code)
@@ -960,10 +998,13 @@ PUSHPLUS_TOKEN = ""
 SERVERCHAN_KEY = ""
 ```
 
-V2.5.0 左侧可以临时一键切换 trial / paid。若希望重启后仍默认 paid，再把 Secrets 中的 `ALLTICK_ACCESS_MODE` 改成 `paid`。''')
+V2.5.1 左侧可以临时一键切换 trial / paid。若希望重启后仍默认 paid，再把 Secrets 中的 `ALLTICK_ACCESS_MODE` 改成 `paid`。''')
 
 with help_tab:
-    st.markdown('''### V2.5.0 真实历史验证版
+    st.markdown('''### V2.5.1 自动循环扫描 + 真实历史验证版
+- **自动循环扫描**：连续竞价时段按左侧设置的30～300秒间隔自动扫描自选股；自动扫描与手动扫描共用同一套新鲜度、状态机、冷却和通知去重保护。
+- **午休自动暂停信号**：11:30～13:00不把旧分钟K当成实时交易信号，但页面定时器继续运行，13:00后自动恢复扫描。
+- **前台会话限制**：V2.5.1 的定时触发依赖打开的Streamlit浏览器会话；关闭页面、手机深度后台或云端休眠时可能暂停，不等同于独立后台服务器。
 - **成交确认自动同步**：确认真实成交后，系统自动更新总持仓、持仓成本、T+1可卖、待接回和操作日志；仍然不会自动下单。
 - **状态备份/恢复**：运行时自动保存临时快照，并可下载/上传JSON备份；备份不保存API Token。Streamlit重启或重新部署前建议手动下载备份。
 - **自动推送去重**：可选择自动推送有效信号，同类信号默认60分钟内不重复推送；只有页面运行或自动刷新时才会检测。
@@ -985,7 +1026,7 @@ with help_tab:
 - **三种策略风格**：稳健 / 均衡 / 进攻。风格主要改变买点、加仓、接回阈值，不弱化风险保护。
 - **数量模型**：低吸按“本轮基准股数”拆批；加仓/接回受状态机次数与待接回仓位限制；卖出类同时受T+1可卖数量限制。
 - **通知升级**：六类非观察信号达到强度阈值后都可发送 PushPlus / Server酱。
-- **策略沙盒**：即使 AllTick Trial 不能访问自选A股，也可以上传分钟CSV验证V2.5.0状态机与六信号。
+- **策略沙盒**：即使 AllTick Trial 不能访问自选A股，也可以上传分钟CSV验证V2.5.1状态机与六信号。
 
 ### 仍然保留 V2.2.3 的保护
 北京时间、API缓存、429退避、604权限状态、Trial安全模式、网页管理自选股和分钟K数据新鲜度保护全部保留。
@@ -999,8 +1040,12 @@ with help_tab:
 - 测试集PF<=1或平均盈亏比<=1时明确判定“不通过”，不自动把历史最优参数投入实盘。
 
 ### 风险说明
-V2.5.0 是规则化研究辅助系统，不会自动下单。历史PF>1不代表未来仍>1；必须再做前向验证、小资金验证，并考虑公告、涨跌停、流动性、复权和重大事件。''')
+V2.5.1 是规则化研究辅助系统，不会自动下单。历史PF>1不代表未来仍>1；必须再做前向验证、小资金验证，并考虑公告、涨跌停、流动性、复权和重大事件。''')
 
-if auto and (summary['alltick_configured'] or summary['tushare_configured']):
-    time.sleep(refresh)
-    st.rerun()
+# V2.5.1 非阻塞浏览器定时器。
+# 9:15~15:00（含午休）保持rerun；只有连续竞价时段真正扫描自选股。
+_now_cn_for_timer = china_now()
+_minutes_now = _now_cn_for_timer.hour * 60 + _now_cn_for_timer.minute
+_auto_window = _now_cn_for_timer.weekday() < 5 and (9 * 60 + 15) <= _minutes_now <= (15 * 60)
+if auto and _auto_window and summary['watchlist_scan_enabled'] and codes:
+    st_autorefresh(interval=int(refresh) * 1000, limit=None, key='v251_auto_watchlist_refresh')
