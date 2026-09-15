@@ -16,7 +16,7 @@ except Exception:
     ts = None
 
 CN_TZ = ZoneInfo('Asia/Shanghai')
-CACHE_DIR = Path(os.getenv('A_SHARE_CACHE_DIR', '/tmp/a_share_monitor_cache_v222'))
+CACHE_DIR = Path(os.getenv('A_SHARE_CACHE_DIR', '/tmp/a_share_monitor_cache_v223'))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 _CONFIG = {
@@ -30,7 +30,92 @@ _CONFIG = {
 _LAST_ALLTICK_CALL = 0.0
 _TUSHARE_PRO = None
 _MEM_CACHE = {}
+_ALLTICK_COOLDOWN_UNTIL = 0.0
+_ALLTICK_BACKOFF_LEVEL = 0
+_HEALTH = {
+    'alltick': {'state': '未验证', 'last_success': None, 'last_error': '', 'last_error_code': '', 'denied_codes': set()},
+    'tushare': {'state': '未验证', 'last_success': None, 'last_error': '', 'last_error_code': '', 'denied_codes': set()},
+}
 
+
+
+
+def china_now():
+    return datetime.now(CN_TZ)
+
+
+def _fmt_cn_dt(value):
+    if not value:
+        return '—'
+    try:
+        if getattr(value, 'tzinfo', None) is None:
+            value = value.replace(tzinfo=CN_TZ)
+        return value.astimezone(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return str(value)
+
+
+def _mark_health(provider, state, error='', code='', success=False, denied_code=''):
+    h = _HEALTH.setdefault(provider, {'state': '未验证', 'last_success': None, 'last_error': '', 'last_error_code': '', 'denied_codes': set()})
+    h['state'] = state
+    if success:
+        h['last_success'] = china_now()
+        h['last_error'] = ''
+        h['last_error_code'] = ''
+    else:
+        h['last_error'] = sanitize_error_text(error) if error else ''
+        h['last_error_code'] = code or ''
+    if denied_code:
+        h.setdefault('denied_codes', set()).add(str(denied_code).split('.')[0].zfill(6))
+
+
+def health_snapshot():
+    now_mono = time.monotonic()
+    cooldown = max(0, int(round(_ALLTICK_COOLDOWN_UNTIL - now_mono)))
+    rows = []
+    for provider in ('alltick', 'tushare'):
+        h = _HEALTH.get(provider, {})
+        configured = bool(_CONFIG.get(f'{provider}_token', ''))
+        state = h.get('state', '未验证') if configured else '未配置'
+        if provider == 'alltick' and cooldown > 0:
+            state = f'限流冷却 {cooldown}s'
+        rows.append({
+            '服务': 'AllTick' if provider == 'alltick' else 'Tushare',
+            '状态': state,
+            '最近成功（北京时间）': _fmt_cn_dt(h.get('last_success')),
+            '最近错误': h.get('last_error', '') or '—',
+            '无权限代码': '、'.join(sorted(h.get('denied_codes', set()))) or '—',
+        })
+    return pd.DataFrame(rows)
+
+
+def data_freshness(df, period='1', live=None):
+    """返回分钟K新鲜度。交易时段数据过旧时锁定实时交易建议。"""
+    live = is_live_session() if live is None else bool(live)
+    if df is None or df.empty or 'datetime' not in df.columns:
+        return {'stale': True, 'age_sec': None, 'latest': None, 'label': '无有效K线'}
+    latest = pd.to_datetime(df['datetime'].max(), errors='coerce')
+    if pd.isna(latest):
+        return {'stale': True, 'age_sec': None, 'latest': None, 'label': 'K线时间无效'}
+    latest_py = latest.to_pydatetime()
+    if latest_py.tzinfo is None:
+        latest_py = latest_py.replace(tzinfo=CN_TZ)
+    now = china_now()
+    age = max(0.0, (now - latest_py.astimezone(CN_TZ)).total_seconds())
+    p = max(1, int(str(period)))
+    threshold = max(180, p * 60 * 2 + 90)
+    stale = bool(live and age > threshold)
+    label = f'{int(age)}秒前' if age < 3600 else f'{age/60:.0f}分钟前'
+    return {'stale': stale, 'age_sec': int(age), 'latest': latest_py, 'label': label, 'threshold_sec': threshold}
+
+
+def _copy_df(value):
+    out = value.copy()
+    try:
+        out.attrs = dict(value.attrs)
+    except Exception:
+        pass
+    return out
 
 class MarketDataError(RuntimeError):
     def __init__(self, message, code='generic'):
@@ -233,35 +318,57 @@ def _resolve_provider(requested, purpose='minute'):
 
 def _alltick_wait():
     global _LAST_ALLTICK_CALL
+    now_mono = time.monotonic()
+    if _ALLTICK_COOLDOWN_UNTIL > now_mono:
+        left = int(round(_ALLTICK_COOLDOWN_UNTIL - now_mono))
+        raise MarketDataError(f'AllTick正在自动退避冷却，还需约 {max(1, left)} 秒。', 'rate_limit')
     gap = float(_CONFIG['alltick_interval'])
-    elapsed = time.monotonic() - _LAST_ALLTICK_CALL
+    elapsed = now_mono - _LAST_ALLTICK_CALL
     if _LAST_ALLTICK_CALL and elapsed < gap:
         time.sleep(gap - elapsed)
     _LAST_ALLTICK_CALL = time.monotonic()
 
 
 def _parse_alltick_response(r):
+    global _ALLTICK_COOLDOWN_UNTIL, _ALLTICK_BACKOFF_LEVEL
     # 不使用 raise_for_status()，避免 requests 把含 token 的完整URL写进异常。
     if r.status_code == 429:
-        raise MarketDataError('AllTick限频：请求过快。V2.2.2 已启用节流，请等待后再试。', 'rate_limit')
+        _ALLTICK_BACKOFF_LEVEL = min(4, _ALLTICK_BACKOFF_LEVEL + 1)
+        wait = min(300, 30 * (2 ** (_ALLTICK_BACKOFF_LEVEL - 1)))
+        _ALLTICK_COOLDOWN_UNTIL = time.monotonic() + wait
+        _mark_health('alltick', '限流', f'触发429，自动冷却{wait}秒', 'rate_limit')
+        raise MarketDataError(f'AllTick限频：已自动进入 {wait} 秒冷却，不会继续硬请求。', 'rate_limit')
     if r.status_code in (401, 403):
+        _mark_health('alltick', 'Token失效', '鉴权失败', 'auth')
         raise MarketDataError('AllTick鉴权失败：请检查 Token 是否有效。', 'auth')
     if r.status_code >= 400:
+        _mark_health('alltick', '服务异常', f'HTTP {r.status_code}', 'http')
         raise MarketDataError(f'AllTick HTTP {r.status_code}：服务暂时不可用。', 'http')
     try:
         payload = r.json()
     except Exception:
+        _mark_health('alltick', '格式异常', '返回不是JSON', 'bad_json')
         raise MarketDataError('AllTick返回格式异常，请稍后再试。', 'bad_json')
     ret = int(payload.get('ret', -1))
     if ret == 200:
+        _ALLTICK_BACKOFF_LEVEL = 0
+        _ALLTICK_COOLDOWN_UNTIL = 0.0
+        _mark_health('alltick', '正常', success=True)
         return payload
     msg = str(payload.get('msg', '') or '')
     if ret == 604 or 'unauthorized' in msg.lower():
+        _mark_health('alltick', '无权限', '当前套餐未包含该股票或接口', 'unauthorized')
         raise MarketDataError('AllTick无权限：当前套餐未包含该股票或接口。', 'unauthorized')
     if ret in (401, 403, 601, 602, 603):
+        _mark_health('alltick', 'Token/权限异常', '鉴权或套餐异常', 'auth')
         raise MarketDataError('AllTick鉴权/权限异常：请检查 Token 和套餐。', 'auth')
     if ret == 429:
-        raise MarketDataError('AllTick限频：请求过快，请稍后再试。', 'rate_limit')
+        _ALLTICK_BACKOFF_LEVEL = min(4, _ALLTICK_BACKOFF_LEVEL + 1)
+        wait = min(300, 30 * (2 ** (_ALLTICK_BACKOFF_LEVEL - 1)))
+        _ALLTICK_COOLDOWN_UNTIL = time.monotonic() + wait
+        _mark_health('alltick', '限流', f'触发429，自动冷却{wait}秒', 'rate_limit')
+        raise MarketDataError(f'AllTick限频：已自动进入 {wait} 秒冷却。', 'rate_limit')
+    _mark_health('alltick', 'API异常', f'返回错误 {ret}', 'api')
     raise MarketDataError(f'AllTick返回错误 {ret}。', 'api')
 
 
@@ -315,7 +422,12 @@ def _fetch_alltick_minute(code, period='1'):
             'adjust_type': 0,
         },
     }
-    payload = _alltick_get('kline', q)
+    try:
+        payload = _alltick_get('kline', q)
+    except MarketDataError as e:
+        if e.code == 'unauthorized':
+            _mark_health('alltick', '无权限', str(e), e.code, denied_code=code)
+        raise
     data = payload.get('data') or {}
     rows = data.get('kline_list') or data.get('kline_data') or []
     out = normalize_minute(pd.DataFrame(rows), keep_days=3)
@@ -351,9 +463,17 @@ def _fetch_tushare_minute(code, period='1'):
     return out
 
 
-def fetch_minute(code, period='1'):
+def fetch_minute(code, period='1', force=False):
     code = str(code).split('.')[0].zfill(6)
+    period = str(period)
     first = _resolve_provider(_CONFIG['minute_provider'], purpose='minute')
+    cache_key = f'minute:{first}:{code}:{period}'
+    ttl = 20 if is_live_session() else 300
+    if not force:
+        cached_mem = _cached_value(cache_key, ttl=ttl)
+        if cached_mem is not None and not cached_mem.empty:
+            cached_mem.attrs['cache_hit'] = True
+            return cached_mem
     order = [first]
     if first == 'alltick' and _CONFIG['tushare_token']:
         order.append('tushare')
@@ -365,13 +485,23 @@ def fetch_minute(code, period='1'):
             continue
         try:
             out = _fetch_alltick_minute(code, period) if provider == 'alltick' else _fetch_tushare_minute(code, period)
+            out.attrs['fetched_at_cn'] = china_now().strftime('%Y-%m-%d %H:%M:%S')
             _save_cache(code, period, out)
+            _put_cache(cache_key, out)
+            _mark_health(provider, '正常', success=True)
             return out
         except Exception as e:
+            if isinstance(e, MarketDataError) and e.code == 'unauthorized':
+                _mark_health(provider, '无权限', str(e), e.code, denied_code=code)
+            elif isinstance(e, MarketDataError):
+                _mark_health(provider, '异常', str(e), e.code)
+            else:
+                _mark_health(provider, '异常', friendly_error(e), 'generic')
             errors.append(f'{provider}: {friendly_error(e)}')
     cached = _load_cache(code, period)
     if not cached.empty:
         cached.attrs['errors'] = ' | '.join(errors)
+        cached.attrs['fetched_at_cn'] = '历史缓存'
         return cached
     if first == 'none':
         raise MarketDataError('尚未配置稳定行情API Token。', 'not_configured')
@@ -397,6 +527,7 @@ def _fetch_tushare_market_snapshot():
     x['turnover'] = 0.0
     x = x[['code', 'name', 'price', 'pre_close', 'pct', 'volume', 'amount', 'turnover']].dropna(subset=['code', 'price'])
     x.attrs['source'] = 'Tushare实时日线'
+    _mark_health('tushare', '正常', success=True)
     return x
 
 
@@ -406,12 +537,12 @@ def _cached_value(key, ttl):
         return None
     ts0, value = row
     if time.monotonic() - ts0 <= ttl:
-        return value.copy() if isinstance(value, pd.DataFrame) else value
+        return _copy_df(value) if isinstance(value, pd.DataFrame) else value
     return None
 
 
 def _put_cache(key, value):
-    _MEM_CACHE[key] = (time.monotonic(), value.copy() if isinstance(value, pd.DataFrame) else value)
+    _MEM_CACHE[key] = (time.monotonic(), _copy_df(value) if isinstance(value, pd.DataFrame) else value)
 
 
 def _alltick_index_returns(force=False):
@@ -435,6 +566,8 @@ def _alltick_index_returns(force=False):
             cur = float(rows[-1]['close_price'])
             items.append({'name': name, 'pct': (cur / prev - 1) * 100, 'price': cur})
     out = pd.DataFrame(items)
+    out.attrs['fetched_at_cn'] = china_now().strftime('%Y-%m-%d %H:%M:%S')
+    _mark_health('alltick', '正常', success=True)
     _put_cache(cache_key, out)
     return out
 
