@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 import uuid
 from datetime import datetime, time as dtime
@@ -15,7 +16,7 @@ except Exception:
     ts = None
 
 CN_TZ = ZoneInfo('Asia/Shanghai')
-CACHE_DIR = Path(os.getenv('A_SHARE_CACHE_DIR', '/tmp/a_share_monitor_cache_v221'))
+CACHE_DIR = Path(os.getenv('A_SHARE_CACHE_DIR', '/tmp/a_share_monitor_cache_v222'))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 _CONFIG = {
@@ -23,20 +24,43 @@ _CONFIG = {
     'market_provider': 'auto',
     'alltick_token': '',
     'tushare_token': '',
-    'alltick_interval': 1.05,
+    'alltick_interval': 10.5,
+    'alltick_access_mode': 'trial',
 }
 _LAST_ALLTICK_CALL = 0.0
 _TUSHARE_PRO = None
+_MEM_CACHE = {}
 
 
-def configure(minute_provider='auto', market_provider='auto', alltick_token='', tushare_token='', alltick_interval=1.05):
+class MarketDataError(RuntimeError):
+    def __init__(self, message, code='generic'):
+        super().__init__(message)
+        self.code = code
+
+
+def configure(
+    minute_provider='auto',
+    market_provider='auto',
+    alltick_token='',
+    tushare_token='',
+    alltick_interval=10.5,
+    alltick_access_mode='trial',
+):
     global _TUSHARE_PRO
+    mode = str(alltick_access_mode or 'trial').lower().strip()
+    if mode not in {'trial', 'paid'}:
+        mode = 'trial'
+    interval = max(0.05, float(alltick_interval or 10.5))
+    # 免费/试用模式按更保守的节奏运行，避免刚好卡在10秒边界触发429。
+    if mode == 'trial':
+        interval = max(10.5, interval)
     _CONFIG.update({
         'minute_provider': str(minute_provider or 'auto').lower(),
         'market_provider': str(market_provider or 'auto').lower(),
         'alltick_token': str(alltick_token or '').strip(),
         'tushare_token': str(tushare_token or '').strip(),
-        'alltick_interval': max(0.05, float(alltick_interval or 1.05)),
+        'alltick_interval': interval,
+        'alltick_access_mode': mode,
     })
     _TUSHARE_PRO = None
 
@@ -47,7 +71,22 @@ def provider_summary():
         'market_provider': _resolve_provider(_CONFIG['market_provider'], purpose='market'),
         'alltick_configured': bool(_CONFIG['alltick_token']),
         'tushare_configured': bool(_CONFIG['tushare_token']),
+        'alltick_access_mode': _CONFIG['alltick_access_mode'],
+        'alltick_interval': _CONFIG['alltick_interval'],
+        'watchlist_scan_enabled': watchlist_scan_enabled(),
     }
+
+
+def watchlist_scan_enabled():
+    minute = _resolve_provider(_CONFIG['minute_provider'], purpose='minute')
+    if minute == 'tushare' and _CONFIG['tushare_token']:
+        return True
+    if minute == 'alltick' and _CONFIG['alltick_token'] and _CONFIG['alltick_access_mode'] == 'paid':
+        return True
+    # auto 下，有可用的Tushare也允许；只有AllTick trial则关闭自选股分钟扫描。
+    if _CONFIG['minute_provider'] == 'auto' and _CONFIG['tushare_token']:
+        return True
+    return False
 
 
 def market_session_status(now=None):
@@ -77,6 +116,27 @@ def code_to_ts(code):
     return f'{code}.SZ'
 
 
+def sanitize_error_text(value):
+    """把任何可能包含 Token / URL 参数的异常转换为可展示文本。"""
+    text = str(value or '')
+    for secret in (_CONFIG.get('alltick_token', ''), _CONFIG.get('tushare_token', '')):
+        if secret:
+            text = text.replace(secret, '***')
+    text = re.sub(r'([?&](?:token|api_key|apikey|key)=)[^&\s]+', r'\1***', text, flags=re.I)
+    text = re.sub(r'(ALLTICK_TOKEN|TUSHARE_TOKEN)\s*[=:]\s*[^\s,;]+', r'\1=***', text, flags=re.I)
+    return text
+
+
+def friendly_error(exc):
+    if isinstance(exc, MarketDataError):
+        return sanitize_error_text(str(exc))
+    if isinstance(exc, requests.Timeout):
+        return '行情API请求超时，请稍后再试。'
+    if isinstance(exc, requests.RequestException):
+        return '行情API网络异常，请稍后再试。'
+    return sanitize_error_text(str(exc))
+
+
 def normalize_minute(df, keep_days=3):
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=['datetime', 'open', 'high', 'low', 'close', 'volume', 'amount'])
@@ -104,7 +164,6 @@ def normalize_minute(df, keep_days=3):
         return pd.DataFrame(columns=need + ['amount'])
     if 'amount' not in x.columns:
         x['amount'] = 0.0
-    # Unix timestamps from AllTick are seconds. String timestamps from Tushare parse directly.
     if pd.api.types.is_numeric_dtype(x['datetime']):
         x['datetime'] = pd.to_datetime(x['datetime'], unit='s', utc=True, errors='coerce').dt.tz_convert(CN_TZ).dt.tz_localize(None)
     else:
@@ -113,7 +172,8 @@ def normalize_minute(df, keep_days=3):
         parsed = pd.to_datetime(raw, errors='coerce')
         if numeric_mask.any():
             nums = pd.to_numeric(raw[numeric_mask], errors='coerce')
-            unit = 'ms' if nums.dropna().astype(str).str.len().max() and nums.dropna().astype(str).str.len().max() >= 13 else 's'
+            lengths = nums.dropna().astype('int64').astype(str).str.len()
+            unit = 'ms' if (not lengths.empty and lengths.max() >= 13) else 's'
             p2 = pd.to_datetime(nums, unit=unit, utc=True, errors='coerce').dt.tz_convert(CN_TZ).dt.tz_localize(None)
             parsed.loc[numeric_mask] = p2.values
         x['datetime'] = parsed
@@ -158,7 +218,6 @@ def _resolve_provider(requested, purpose='minute'):
     requested = str(requested or 'auto').lower()
     if requested in ('alltick', 'tushare'):
         return requested
-    # auto: AllTick优先做分钟，Tushare优先做全市场截面。
     if purpose == 'market':
         if _CONFIG['tushare_token']:
             return 'tushare'
@@ -174,43 +233,76 @@ def _resolve_provider(requested, purpose='minute'):
 
 def _alltick_wait():
     global _LAST_ALLTICK_CALL
-    gap = _CONFIG['alltick_interval']
+    gap = float(_CONFIG['alltick_interval'])
     elapsed = time.monotonic() - _LAST_ALLTICK_CALL
     if _LAST_ALLTICK_CALL and elapsed < gap:
         time.sleep(gap - elapsed)
     _LAST_ALLTICK_CALL = time.monotonic()
 
 
+def _parse_alltick_response(r):
+    # 不使用 raise_for_status()，避免 requests 把含 token 的完整URL写进异常。
+    if r.status_code == 429:
+        raise MarketDataError('AllTick限频：请求过快。V2.2.2 已启用节流，请等待后再试。', 'rate_limit')
+    if r.status_code in (401, 403):
+        raise MarketDataError('AllTick鉴权失败：请检查 Token 是否有效。', 'auth')
+    if r.status_code >= 400:
+        raise MarketDataError(f'AllTick HTTP {r.status_code}：服务暂时不可用。', 'http')
+    try:
+        payload = r.json()
+    except Exception:
+        raise MarketDataError('AllTick返回格式异常，请稍后再试。', 'bad_json')
+    ret = int(payload.get('ret', -1))
+    if ret == 200:
+        return payload
+    msg = str(payload.get('msg', '') or '')
+    if ret == 604 or 'unauthorized' in msg.lower():
+        raise MarketDataError('AllTick无权限：当前套餐未包含该股票或接口。', 'unauthorized')
+    if ret in (401, 403, 601, 602, 603):
+        raise MarketDataError('AllTick鉴权/权限异常：请检查 Token 和套餐。', 'auth')
+    if ret == 429:
+        raise MarketDataError('AllTick限频：请求过快，请稍后再试。', 'rate_limit')
+    raise MarketDataError(f'AllTick返回错误 {ret}。', 'api')
+
+
 def _alltick_get(path, query):
     token = _CONFIG['alltick_token']
     if not token:
-        raise RuntimeError('未配置 AllTick Token')
+        raise MarketDataError('未配置 AllTick Token。', 'not_configured')
     _alltick_wait()
     url = f'https://quote.alltick.co/quote-stock-b-api/{path}'
-    r = requests.get(url, params={'token': token, 'query': json.dumps(query, ensure_ascii=False, separators=(',', ':'))}, timeout=15)
-    r.raise_for_status()
-    payload = r.json()
-    if int(payload.get('ret', -1)) != 200:
-        raise RuntimeError(f"AllTick {payload.get('ret')}: {payload.get('msg', '请求失败')}")
-    return payload
+    try:
+        r = requests.get(
+            url,
+            params={'token': token, 'query': json.dumps(query, ensure_ascii=False, separators=(',', ':'))},
+            timeout=15,
+        )
+    except requests.Timeout as e:
+        raise MarketDataError('AllTick请求超时，请稍后再试。', 'timeout') from e
+    except requests.RequestException as e:
+        raise MarketDataError('AllTick网络异常，请稍后再试。', 'network') from e
+    return _parse_alltick_response(r)
 
 
 def _alltick_post_batch(data_list):
     token = _CONFIG['alltick_token']
     if not token:
-        raise RuntimeError('未配置 AllTick Token')
+        raise MarketDataError('未配置 AllTick Token。', 'not_configured')
     _alltick_wait()
     url = 'https://quote.alltick.co/quote-stock-b-api/batch-kline'
     body = {'trace': uuid.uuid4().hex, 'data': {'data_list': data_list}}
-    r = requests.post(url, params={'token': token}, json=body, timeout=15)
-    r.raise_for_status()
-    payload = r.json()
-    if int(payload.get('ret', -1)) != 200:
-        raise RuntimeError(f"AllTick {payload.get('ret')}: {payload.get('msg', '请求失败')}")
-    return payload
+    try:
+        r = requests.post(url, params={'token': token}, json=body, timeout=15)
+    except requests.Timeout as e:
+        raise MarketDataError('AllTick请求超时，请稍后再试。', 'timeout') from e
+    except requests.RequestException as e:
+        raise MarketDataError('AllTick网络异常，请稍后再试。', 'network') from e
+    return _parse_alltick_response(r)
 
 
 def _fetch_alltick_minute(code, period='1'):
+    if _CONFIG['alltick_access_mode'] == 'trial':
+        raise MarketDataError('AllTick试用安全模式：已关闭自选股分钟K请求，避免429/604。升级套餐后把 ALLTICK_ACCESS_MODE 改为 "paid"。', 'trial_block')
     period = str(period)
     ktype = {'1': 1, '5': 2, '15': 3, '30': 4, '60': 5}.get(period, 1)
     q = {
@@ -228,7 +320,7 @@ def _fetch_alltick_minute(code, period='1'):
     rows = data.get('kline_list') or data.get('kline_data') or []
     out = normalize_minute(pd.DataFrame(rows), keep_days=3)
     if out.empty:
-        raise RuntimeError('AllTick 返回的分钟K线为空；请确认套餐已包含该A股代码')
+        raise MarketDataError('AllTick分钟K为空，请确认套餐包含该A股代码。', 'empty')
     out.attrs['source'] = 'AllTick'
     return out
 
@@ -237,21 +329,24 @@ def _tushare_pro():
     global _TUSHARE_PRO
     token = _CONFIG['tushare_token']
     if not token:
-        raise RuntimeError('未配置 Tushare Token')
+        raise MarketDataError('未配置 Tushare Token。', 'not_configured')
     if ts is None:
-        raise RuntimeError('未安装 tushare，请检查 requirements.txt')
+        raise MarketDataError('未安装 tushare，请检查 requirements.txt。', 'dependency')
     if _TUSHARE_PRO is None:
         _TUSHARE_PRO = ts.pro_api(token)
     return _TUSHARE_PRO
 
 
 def _fetch_tushare_minute(code, period='1'):
-    pro = _tushare_pro()
-    freq = f'{str(period).upper()}MIN'
-    raw = pro.rt_min_daily(freq=freq, ts_code=code_to_ts(code))
+    try:
+        pro = _tushare_pro()
+        freq = f'{str(period).upper()}MIN'
+        raw = pro.rt_min_daily(freq=freq, ts_code=code_to_ts(code))
+    except Exception as e:
+        raise MarketDataError(f'Tushare实时分钟失败：{sanitize_error_text(e)}', 'tushare') from e
     out = normalize_minute(raw, keep_days=1)
     if out.empty:
-        raise RuntimeError('Tushare 实时分钟为空；休市时可能无当日累计数据，或账号未开通实时分钟权限')
+        raise MarketDataError('Tushare实时分钟为空；可能未开通实时分钟权限，或当前没有当日数据。', 'empty')
     out.attrs['source'] = 'Tushare实时分钟'
     return out
 
@@ -266,26 +361,31 @@ def fetch_minute(code, period='1'):
         order.append('alltick')
     errors = []
     for provider in order:
+        if provider == 'none':
+            continue
         try:
             out = _fetch_alltick_minute(code, period) if provider == 'alltick' else _fetch_tushare_minute(code, period)
             _save_cache(code, period, out)
             return out
         except Exception as e:
-            errors.append(f'{provider}: {e}')
+            errors.append(f'{provider}: {friendly_error(e)}')
     cached = _load_cache(code, period)
     if not cached.empty:
         cached.attrs['errors'] = ' | '.join(errors)
         return cached
     if first == 'none':
-        raise RuntimeError('尚未配置稳定行情API Token。请先配置 AllTick 或 Tushare。')
-    raise RuntimeError('；'.join(errors))
+        raise MarketDataError('尚未配置稳定行情API Token。', 'not_configured')
+    raise MarketDataError('；'.join(errors), 'all_failed')
 
 
 def _fetch_tushare_market_snapshot():
-    pro = _tushare_pro()
-    raw = pro.rt_k(ts_code='0*.SZ,3*.SZ,6*.SH,4*.BJ,8*.BJ,9*.BJ')
+    try:
+        pro = _tushare_pro()
+        raw = pro.rt_k(ts_code='0*.SZ,3*.SZ,6*.SH,4*.BJ,8*.BJ,9*.BJ')
+    except Exception as e:
+        raise MarketDataError(f'Tushare实时日线失败：{sanitize_error_text(e)}', 'tushare') from e
     if raw is None or raw.empty:
-        raise RuntimeError('Tushare rt_k 返回空数据')
+        raise MarketDataError('Tushare rt_k 返回空数据。', 'empty')
     x = raw.copy()
     x['code'] = x['ts_code'].astype(str).str.extract(r'(\d{6})', expand=False)
     x['name'] = x.get('name', '')
@@ -300,8 +400,27 @@ def _fetch_tushare_market_snapshot():
     return x
 
 
-def _alltick_index_returns():
-    # AllTick基础版/以上可把两个大盘指数加入产品篮子；免费版也包含演示指数。
+def _cached_value(key, ttl):
+    row = _MEM_CACHE.get(key)
+    if not row:
+        return None
+    ts0, value = row
+    if time.monotonic() - ts0 <= ttl:
+        return value.copy() if isinstance(value, pd.DataFrame) else value
+    return None
+
+
+def _put_cache(key, value):
+    _MEM_CACHE[key] = (time.monotonic(), value.copy() if isinstance(value, pd.DataFrame) else value)
+
+
+def _alltick_index_returns(force=False):
+    # trial/free 只用演示指数验证连通性，不访问用户自选股票。
+    cache_key = 'alltick_index_returns'
+    if not force:
+        cached = _cached_value(cache_key, ttl=25)
+        if cached is not None:
+            return cached
     items = []
     for code, name in [('000001.SH', '上证指数'), ('399001.SZ', '深证成指')]:
         q = {
@@ -315,7 +434,9 @@ def _alltick_index_returns():
             prev = float(rows[-2]['close_price'])
             cur = float(rows[-1]['close_price'])
             items.append({'name': name, 'pct': (cur / prev - 1) * 100, 'price': cur})
-    return pd.DataFrame(items)
+    out = pd.DataFrame(items)
+    _put_cache(cache_key, out)
+    return out
 
 
 def market_regime():
@@ -335,39 +456,34 @@ def market_regime():
             top = valid.sort_values('pct', ascending=False).head(10)[['code', 'name', 'pct', 'amount']]
             return {'score': round(score, 1), 'label': label, 'breadth': round(breadth, 1), 'avg_pct': round(avg, 2), 'top': top, 'source': spot.attrs.get('source'), 'status': status, 'error': ''}
         except Exception as e:
-            # 如果同时配置AllTick，用指数环境继续运行。
             if _CONFIG['alltick_token']:
                 provider = 'alltick'
             else:
-                return {'score': 50, 'label': '市场API不可用', 'breadth': None, 'avg_pct': 0.0, 'top': pd.DataFrame(), 'source': 'Tushare', 'status': status, 'error': str(e)}
+                return {'score': 50, 'label': '市场API不可用', 'breadth': None, 'avg_pct': 0.0, 'top': pd.DataFrame(), 'source': 'Tushare', 'status': status, 'error': friendly_error(e)}
     if provider == 'alltick':
         try:
             idx = _alltick_index_returns()
             if idx.empty:
-                raise RuntimeError('指数数据为空')
+                raise MarketDataError('指数数据为空。', 'empty')
             avg = float(idx['pct'].mean())
             score = max(0, min(100, 50 + avg * 8))
             label = '强势' if score >= 70 else '偏强' if score >= 58 else '震荡' if score >= 42 else '偏弱' if score >= 30 else '弱势'
             top = idx.rename(columns={'name': 'code'})[['code', 'pct']].copy()
             return {'score': round(score, 1), 'label': f'{label}·指数', 'breadth': None, 'avg_pct': round(avg, 2), 'top': top, 'source': 'AllTick大盘指数', 'status': status, 'error': ''}
         except Exception as e:
-            return {'score': 50, 'label': '指数API不可用', 'breadth': None, 'avg_pct': 0.0, 'top': pd.DataFrame(), 'source': 'AllTick', 'status': status, 'error': str(e)}
+            return {'score': 50, 'label': '指数API不可用', 'breadth': None, 'avg_pct': 0.0, 'top': pd.DataFrame(), 'source': 'AllTick', 'status': status, 'error': friendly_error(e)}
 
 
 def radar_candidates(limit=30, min_amount=1e8):
-    """稳定全市场雷达需要 Tushare 实时日线权限。
-
-    AllTick基础/高级套餐是自选产品篮子，不应伪装成全市场扫描；因此没有Tushare市场权限时返回空表。
-    """
     if not _CONFIG['tushare_token']:
         out = pd.DataFrame()
-        out.attrs['error'] = '全市场雷达需要 Tushare 实时日线权限；AllTick 普通套餐仅扫描已订阅产品。'
+        out.attrs['error'] = '全市场雷达需要 Tushare 实时日线权限；AllTick 普通产品篮子不能替代全市场截面。'
         return out
     try:
         x = _fetch_tushare_market_snapshot()
     except Exception as e:
         out = pd.DataFrame()
-        out.attrs['error'] = str(e)
+        out.attrs['error'] = friendly_error(e)
         return out
     x = x[(x.price > 0) & (~x.name.astype(str).str.contains('ST|退|N|C', regex=True, na=False))].copy()
     x = x[pd.to_numeric(x['amount'], errors='coerce').fillna(0) >= float(min_amount)]
@@ -383,25 +499,34 @@ def radar_candidates(limit=30, min_amount=1e8):
 def diagnose(sample_code='600519', period='1'):
     rows = []
     if _CONFIG['alltick_token']:
-        try:
-            df = _fetch_alltick_minute(sample_code, period)
-            rows.append({'服务': 'AllTick分钟K', '状态': '✅ 正常', '详情': f'{len(df)}根；最新 {df.datetime.max()}'} )
-        except Exception as e:
-            rows.append({'服务': 'AllTick分钟K', '状态': '❌ 失败', '详情': str(e)})
+        if _CONFIG['alltick_access_mode'] == 'trial':
+            try:
+                idx = _alltick_index_returns()
+                detail = '、'.join(f"{r['name']} {r['pct']:.2f}%" for _, r in idx.iterrows()) if not idx.empty else '指数数据为空'
+                rows.append({'服务': 'AllTick试用连通性', '状态': '✅ 正常' if not idx.empty else '⚠️ 空数据', '详情': detail})
+                rows.append({'服务': 'AllTick自选股分钟K', '状态': '🔒 已保护', '详情': 'trial模式不请求自选股，避免429/604；升级套餐后改为 paid'})
+            except Exception as e:
+                rows.append({'服务': 'AllTick试用连通性', '状态': '❌ 失败', '详情': friendly_error(e)})
+        else:
+            try:
+                df = _fetch_alltick_minute(sample_code, period)
+                rows.append({'服务': 'AllTick分钟K', '状态': '✅ 正常', '详情': f'{len(df)}根；最新 {df.datetime.max()}'} )
+            except Exception as e:
+                rows.append({'服务': 'AllTick分钟K', '状态': '❌ 失败', '详情': friendly_error(e)})
     else:
-        rows.append({'服务': 'AllTick分钟K', '状态': '未配置', '详情': '需要 ALLTICK_TOKEN'})
+        rows.append({'服务': 'AllTick', '状态': '未配置', '详情': '需要 ALLTICK_TOKEN'})
     if _CONFIG['tushare_token']:
         try:
             pro = _tushare_pro()
             q = pro.rt_k(ts_code=code_to_ts(sample_code))
             rows.append({'服务': 'Tushare实时日线', '状态': '✅ 正常' if q is not None and not q.empty else '⚠️ 空数据', '详情': f'{0 if q is None else len(q)}行'})
         except Exception as e:
-            rows.append({'服务': 'Tushare实时日线', '状态': '❌ 失败', '详情': str(e)})
+            rows.append({'服务': 'Tushare实时日线', '状态': '❌ 失败', '详情': friendly_error(e)})
         try:
             df = _fetch_tushare_minute(sample_code, period)
             rows.append({'服务': 'Tushare实时分钟', '状态': '✅ 正常', '详情': f'{len(df)}根；最新 {df.datetime.max()}'} )
         except Exception as e:
-            rows.append({'服务': 'Tushare实时分钟', '状态': '❌ 失败', '详情': str(e)})
+            rows.append({'服务': 'Tushare实时分钟', '状态': '❌ 失败', '详情': friendly_error(e)})
     else:
         rows.append({'服务': 'Tushare实时日线', '状态': '未配置', '详情': '需要 TUSHARE_TOKEN + 对应权限'})
         rows.append({'服务': 'Tushare实时分钟', '状态': '未配置', '详情': '需要 TUSHARE_TOKEN + 实时分钟权限'})
