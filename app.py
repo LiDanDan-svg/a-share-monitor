@@ -21,14 +21,14 @@ from data import (
     provider_summary,
     radar_candidates,
 )
-from strategy import analyze
+from strategy import analyze, ENGINE_BUILD
 from state_machine import TradeState, advance_day, apply_fill, cooldown_remaining, plan_qty, register_signal
 from portfolio_store import (
     build_snapshot, load_runtime_snapshot, parse_uploaded_snapshot,
     save_runtime_snapshot, snapshot_json, unpack_snapshot,
 )
 
-APP_VERSION = '2.4.0'
+APP_VERSION = '2.4.0.1'
 WATCHLIST_FILE = Path(__file__).with_name('watchlist.json')
 
 st.set_page_config(
@@ -303,6 +303,7 @@ def maybe_auto_notify(code, sig, qty, when, enabled, cooldown_minutes, pp_token,
 
 st.title(f'📈 A股主升浪雷达 V{APP_VERSION}')
 st.caption('实盘联调版｜真实成交确认自动同步持仓｜信号去重推送｜状态备份/恢复｜不自动下单｜研究辅助，不构成投资建议')
+st.caption(f'策略内核：{ENGINE_BUILD}｜卖出数量按计划比例向下取整到100股整数手')
 
 with st.sidebar:
     st.header('⚙️ 行情与运行模式')
@@ -391,7 +392,7 @@ with st.sidebar:
     refresh = st.slider('刷新秒数', 30, 300, 60, 10)
 
     st.divider()
-    st.subheader('🎯 V2.4.0 策略参数')
+    st.subheader('🎯 V2.4.0.1 策略参数')
     strategy_style = st.selectbox(
         '策略风格', ['稳健', '均衡', '进攻'], index=1,
         help='进攻模式降低买点/加仓阈值；稳健模式提高阈值。高抛和风险退出阈值不会因进攻模式而明显放宽。',
@@ -717,7 +718,7 @@ else:
 
 if codes:
     st.markdown('#### 🧭 状态机手动登记')
-    st.caption('只有实际成交后才确认。V2.4.0确认成交会自动同步总持仓、成本、T+1可卖和待接回，不再要求你手工二次修改持仓。')
+    st.caption('只有实际成交后才确认。V2.4.0.1确认成交会自动同步总持仓、成本、T+1可卖和待接回，不再要求你手工二次修改持仓。')
     exec_code = st.selectbox('登记股票', codes, key='exec_code')
     last_sig = st.session_state.last_analysis.get(exec_code)
     state = get_trade_state(exec_code)
@@ -750,7 +751,7 @@ with bt_tab:
         df['datetime'] = pd.to_datetime(df['datetime'])
         sandbox_sig = analyze(df, holding=0, market_score=regime['score'], avg_cost=0.0, base_qty=base_qty, style=strategy_style)
         if sandbox_sig:
-            st.markdown('#### V2.4.0 策略沙盒：CSV最后一根K线')
+            st.markdown('#### V2.4.0.1 策略沙盒：CSV最后一根K线')
             q1, q2, q3, q4, q5, q6 = st.columns(6)
             q1.metric('动作', sandbox_sig.action)
             q2.metric('强度', sandbox_sig.strength)
@@ -802,10 +803,10 @@ PUSHPLUS_TOKEN = ""
 SERVERCHAN_KEY = ""
 ```
 
-V2.4.0 左侧可以临时一键切换 trial / paid。若希望重启后仍默认 paid，再把 Secrets 中的 `ALLTICK_ACCESS_MODE` 改成 `paid`。''')
+V2.4.0.1 左侧可以临时一键切换 trial / paid。若希望重启后仍默认 paid，再把 Secrets 中的 `ALLTICK_ACCESS_MODE` 改成 `paid`。''')
 
 with help_tab:
-    st.markdown('''### V2.4.0 实盘联调版
+    st.markdown('''### V2.4.0.1 实盘联调版
 - **成交确认自动同步**：确认真实成交后，系统自动更新总持仓、持仓成本、T+1可卖、待接回和操作日志；仍然不会自动下单。
 - **状态备份/恢复**：运行时自动保存临时快照，并可下载/上传JSON备份；备份不保存API Token。Streamlit重启或重新部署前建议手动下载备份。
 - **自动推送去重**：可选择自动推送有效信号，同类信号默认60分钟内不重复推送；只有页面运行或自动刷新时才会检测。
@@ -827,13 +828,13 @@ with help_tab:
 - **三种策略风格**：稳健 / 均衡 / 进攻。风格主要改变买点、加仓、接回阈值，不弱化风险保护。
 - **数量模型**：低吸按“本轮基准股数”拆批；加仓/接回受状态机次数与待接回仓位限制；卖出类同时受T+1可卖数量限制。
 - **通知升级**：六类非观察信号达到强度阈值后都可发送 PushPlus / Server酱。
-- **策略沙盒**：即使 AllTick Trial 不能访问自选A股，也可以上传分钟CSV验证V2.4.0状态机与六信号。
+- **策略沙盒**：即使 AllTick Trial 不能访问自选A股，也可以上传分钟CSV验证V2.4.0.1状态机与六信号。
 
 ### 仍然保留 V2.2.3 的保护
 北京时间、API缓存、429退避、604权限状态、Trial安全模式、网页管理自选股和分钟K数据新鲜度保护全部保留。
 
 ### 风险说明
-V2.4.0 是规则化研究辅助系统，不会自动下单。分钟级技术信号不能替代基本面、公告、涨跌停、流动性和重大事件判断。''')
+V2.4.0.1 是规则化研究辅助系统，不会自动下单。分钟级技术信号不能替代基本面、公告、涨跌停、流动性和重大事件判断。''')
 
 if auto and (summary['alltick_configured'] or summary['tushare_configured']):
     time.sleep(refresh)

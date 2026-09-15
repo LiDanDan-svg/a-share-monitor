@@ -3,6 +3,8 @@ import numpy as np
 
 from indicators import add_indicators
 
+ENGINE_BUILD = "2.4.0.1-floor"
+
 
 @dataclass
 class Signal:
