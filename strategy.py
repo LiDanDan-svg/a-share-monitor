@@ -1,6 +1,4 @@
 from dataclasses import dataclass
-from math import ceil
-
 import numpy as np
 
 from indicators import add_indicators
@@ -57,11 +55,14 @@ def _round_lot(qty, lot=100):
 
 
 def _sell_qty(holding, pct, lot=100):
+    """按计划比例向下取整到整数手，绝不因为取整而超出计划卖出比例。"""
     holding = max(0, int(holding or 0))
-    if holding < lot:
+    lot = max(1, int(lot))
+    if holding < lot or float(pct or 0) <= 0:
         return 0
-    raw = max(lot, int(ceil(holding * pct / lot)) * lot)
-    return min(_round_lot(holding, lot), raw)
+    planned = holding * float(pct)
+    raw = int(planned // lot) * lot
+    return min(_round_lot(holding, lot), max(0, raw))
 
 
 def analyze(
@@ -351,7 +352,7 @@ def analyze(
             action = '风险退出候选'
             pct = 1.0 if risk >= 88 else 0.5
             qty = _sell_qty(sellable_holding, pct, lot)
-            qty_reason = f'风险分{risk}：按今日可卖{sellable_holding}股的{int(pct*100)}%退出，按{lot}股整数手取整'
+            qty_reason = f'风险分{risk}：按今日可卖{sellable_holding}股的{int(pct*100)}%退出，按{lot}股整数手向下取整，不超过计划比例'
         else:
             action = '风险回避'
         selected_reasons = reasons['risk']
@@ -360,7 +361,7 @@ def analyze(
         action = '减仓候选'
         reduce_pct = 0.33 if reduce < 82 else 0.5
         qty = _sell_qty(sellable_holding, reduce_pct, lot)
-        qty_reason = f'减仓分{reduce}：按今日可卖{sellable_holding}股的{int(reduce_pct*100)}%减仓，按{lot}股整数手向上取整'
+        qty_reason = f'减仓分{reduce}：按今日可卖{sellable_holding}股的{int(reduce_pct*100)}%减仓，按{lot}股整数手向下取整，不超过计划比例'
         selected_reasons = reasons['reduce']
     elif sell >= sell_th:
         action_family = 'sell'
@@ -368,7 +369,7 @@ def analyze(
             action = '强高抛候选' if sell >= 82 else '高抛候选'
             sell_pct = 0.50 if sell >= 88 else 0.33
             qty = _sell_qty(sellable_holding, sell_pct, lot)
-            qty_reason = f'高抛分{sell}：按今日可卖{sellable_holding}股的{int(sell_pct*100)}%做T，按{lot}股整数手向上取整'
+            qty_reason = f'高抛分{sell}：按今日可卖{sellable_holding}股的{int(sell_pct*100)}%做T，按{lot}股整数手向下取整，不超过计划比例'
         else:
             action = '过热·不追'
         selected_reasons = reasons['sell']

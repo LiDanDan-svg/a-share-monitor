@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from alerts import send_pushplus, send_serverchan
-from backtest_v232 import backtest
+from backtest_v240 import backtest
 from data import (
     china_now,
     configure,
@@ -22,9 +22,13 @@ from data import (
     radar_candidates,
 )
 from strategy import analyze
-from state_machine import TradeState, advance_day, cooldown_remaining, plan_qty, register_signal
+from state_machine import TradeState, advance_day, apply_fill, cooldown_remaining, plan_qty, register_signal
+from portfolio_store import (
+    build_snapshot, load_runtime_snapshot, parse_uploaded_snapshot,
+    save_runtime_snapshot, snapshot_json, unpack_snapshot,
+)
 
-APP_VERSION = '2.3.2'
+APP_VERSION = '2.4.0'
 WATCHLIST_FILE = Path(__file__).with_name('watchlist.json')
 
 st.set_page_config(
@@ -92,10 +96,86 @@ if 'last_live_signal' not in st.session_state:
     st.session_state.last_live_signal = {}
 if 'last_analysis' not in st.session_state:
     st.session_state.last_analysis = {}
+if 'last_plan_qty' not in st.session_state:
+    st.session_state.last_plan_qty = {}
+if 'last_plan_block' not in st.session_state:
+    st.session_state.last_plan_block = {}
+if 'execution_log' not in st.session_state:
+    st.session_state.execution_log = []
+if 'notification_last' not in st.session_state:
+    st.session_state.notification_last = {}
+if 'notification_log' not in st.session_state:
+    st.session_state.notification_log = []
+if '_pending_widget_sync' not in st.session_state:
+    st.session_state._pending_widget_sync = {}
 if st.session_state.get('_app_version') != APP_VERSION:
     st.session_state['_app_version'] = APP_VERSION
     st.session_state.pop('results', None)
     st.session_state.pop('radar', None)
+
+
+def _snapshot_payload():
+    return build_snapshot(
+        st.session_state.watch,
+        st.session_state.holdings,
+        st.session_state.costs,
+        st.session_state.sellable,
+        st.session_state.trade_states,
+        execution_log=st.session_state.execution_log,
+        last_live_signal=st.session_state.last_live_signal,
+        notification_last=st.session_state.notification_last,
+        notification_log=st.session_state.notification_log,
+    )
+
+
+def _save_runtime_state():
+    return save_runtime_snapshot(_snapshot_payload())
+
+
+def _queue_widget_sync(code):
+    code = str(code).zfill(6)
+    st.session_state._pending_widget_sync[code] = {
+        'hold': int(st.session_state.holdings.get(code, 0) or 0),
+        'sellable': int(st.session_state.sellable.get(code, 0) or 0),
+        'cost': float(st.session_state.costs.get(code, 0.0) or 0.0),
+    }
+
+
+def _apply_pending_widget_sync():
+    pending = dict(st.session_state.get('_pending_widget_sync', {}) or {})
+    for code, row in pending.items():
+        st.session_state['hold_' + code] = int(row.get('hold', 0) or 0)
+        st.session_state['sellable_' + code] = int(row.get('sellable', 0) or 0)
+        st.session_state['cost_' + code] = float(row.get('cost', 0.0) or 0.0)
+    st.session_state._pending_widget_sync = {}
+
+
+def _apply_snapshot(payload):
+    restored = unpack_snapshot(payload)
+    st.session_state.watch = restored['watch']
+    st.session_state.holdings = restored['holdings']
+    st.session_state.costs = restored['costs']
+    st.session_state.sellable = restored['sellable']
+    st.session_state.trade_states = restored['trade_states']
+    st.session_state.execution_log = restored['execution_log']
+    st.session_state.last_live_signal = restored['last_live_signal']
+    st.session_state.notification_last = restored['notification_last']
+    st.session_state.notification_log = restored['notification_log']
+    for code in st.session_state.watch:
+        _queue_widget_sync(code)
+
+
+if not st.session_state.get('_runtime_snapshot_loaded'):
+    runtime_snapshot = load_runtime_snapshot()
+    if runtime_snapshot:
+        try:
+            _apply_snapshot(runtime_snapshot)
+        except Exception:
+            pass
+    st.session_state['_runtime_snapshot_loaded'] = True
+
+# 必须在侧边栏 number_input 创建前同步控件值。
+_apply_pending_widget_sync()
 
 
 def get_trade_state(code):
@@ -106,7 +186,12 @@ def get_trade_state(code):
     state.shares = int(st.session_state.holdings.get(code, 0) or 0)
     state.sellable = min(state.shares, int(st.session_state.sellable.get(code, state.shares) or 0))
     state.avg_cost = float(st.session_state.costs.get(code, 0.0) or 0.0)
+    old_day = state.day
     advance_day(state, china_now())
+    if old_day is not None and state.day != old_day:
+        # 只有状态机确认跨交易日时才自动解锁T+1，不在同日重启时误把新买股份变成可卖。
+        st.session_state.sellable[code] = int(state.sellable)
+        _queue_widget_sync(code)
     return state
 
 
@@ -129,57 +214,95 @@ def evaluate_live_signal(code, sig, when, base_qty, cooldown_min=15, register=Tr
     }
 
 def confirm_plan_execution(code, sig, qty, price):
-    """只记录策略状态；真实持仓/可卖数量仍以左侧用户输入为准。"""
+    """用户确认真实成交后，自动同步总持仓、成本、T+1可卖和状态机。不会自动下单。"""
     state = get_trade_state(code)
     qty = max(0, int(qty // 100) * 100)
     family = sig.action_family
+    if family not in {'buy', 'add', 'sell', 'reentry', 'reduce', 'risk'}:
+        return '当前不是需要登记成交的交易信号。'
     if qty <= 0:
         return '数量不足100股，未记录。'
-    if family == 'buy':
-        state.buy_used += qty
-        state.buy_count += 1
-    elif family == 'add':
-        state.add_count += 1
-    elif family == 'sell':
-        qty = min(qty, state.sellable)
+
+    if family in {'sell', 'reduce', 'risk'}:
+        qty = min(qty, int(state.sellable // 100) * 100)
         if qty <= 0:
             return 'T+1限制：当前可卖股数为0，未记录。'
-        state.sold_pool += qty
-        state.reentry_pending = True
-        state.last_sell_price = float(price)
-        state.reentry_low = float(sig.reentry_low)
-        state.reentry_high = float(sig.reentry_high)
-    elif family == 'reduce':
-        qty = min(qty, state.sellable)
+    if family == 'reentry':
+        qty = min(qty, int(state.sold_pool // 100) * 100)
         if qty <= 0:
-            return 'T+1限制：当前可卖股数为0，未记录。'
-        # 减仓是风险管理，不建立待接回；并取消已有的做T接回计划。
-        state.reentry_pending = False
-        state.sold_pool = 0
-        state.last_sell_price = 0.0
-        state.reentry_low = 0.0
-        state.reentry_high = 0.0
-    elif family == 'reentry':
-        qty = min(qty, state.sold_pool)
-        state.sold_pool = max(0, state.sold_pool - qty)
-        if state.sold_pool < 100:
-            state.sold_pool = 0
-            state.reentry_pending = False
-    elif family == 'risk':
-        state.reentry_pending = False
-        state.sold_pool = 0
-        state.last_sell_price = 0.0
-        state.reentry_low = 0.0
-        state.reentry_high = 0.0
-    else:
-        return '当前不是需要记录成交的交易信号。'
-    state.ops_today += 1
-    state.last_trade_time = pd.Timestamp(china_now())
-    register_signal(state, family, china_now())
-    return f'已记录：{sig.action} {qty}股。请同步更新左侧真实持仓/可卖股数。'
+            return '当前没有可接回的已高抛仓位。'
+
+    before = {'shares': state.shares, 'sellable': state.sellable, 'avg_cost': state.avg_cost}
+    when = pd.Timestamp(china_now())
+    apply_fill(
+        state, family, qty, float(price), when, lot=100,
+        reentry_low=float(sig.reentry_low), reentry_high=float(sig.reentry_high),
+    )
+    st.session_state.holdings[code] = int(state.shares)
+    st.session_state.sellable[code] = int(state.sellable)
+    st.session_state.costs[code] = float(state.avg_cost)
+    _queue_widget_sync(code)
+    st.session_state.execution_log.append({
+        '时间': when.strftime('%Y-%m-%d %H:%M:%S'),
+        '代码': code,
+        '动作': sig.action,
+        '方向': family.upper(),
+        '成交价': round(float(price), 4),
+        '成交股数': int(qty),
+        '成交前持仓': int(before['shares']),
+        '成交后持仓': int(state.shares),
+        '成交后可卖': int(state.sellable),
+        '成交后成本': round(float(state.avg_cost), 4),
+        '待接回': int(state.sold_pool),
+    })
+    _save_runtime_state()
+    return f'已登记真实成交：{sig.action} {qty}股 @ {float(price):.3f}；持仓/成本/T+1可卖已自动同步。'
+
+
+def _signal_message(code, sig, qty):
+    return (
+        f'{code} {sig.action}<br>现价 {sig.price:.2f}<br>信号强度 {sig.strength}<br>'
+        f'趋势 {sig.trend_score} / 动量 {sig.momentum_score}<br>'
+        f'买点 {sig.buy_score} / 加仓 {sig.add_score} / 高抛 {sig.sell_score} / 接回 {sig.reentry_score}<br>'
+        f'减仓 {sig.reduce_score} / 风险 {sig.risk_score}<br>'
+        f'建议 {qty}股<br>数量依据 {sig.qty_reason}<br>接回区间 {sig.reentry_low:.2f}-{sig.reentry_high:.2f}<br>'
+        f'结构失效 {sig.invalid:.2f} / 风险退出参考 {sig.stop_price:.2f}'
+    )
+
+
+def maybe_auto_notify(code, sig, qty, when, enabled, cooldown_minutes, pp_token, sc_key):
+    if not enabled or qty <= 0 or sig.action_family == 'hold' or sig.strength < 65:
+        return ''
+    key = f'{code}:{sig.action_family}'
+    now = pd.Timestamp(when)
+    last_raw = st.session_state.notification_last.get(key)
+    if last_raw:
+        try:
+            elapsed = (now - pd.Timestamp(last_raw)).total_seconds() / 60
+            if elapsed < cooldown_minutes:
+                return ''
+        except Exception:
+            pass
+    msg = _signal_message(code, sig, qty)
+    results = []
+    if pp_token:
+        ok, detail = send_pushplus(pp_token, 'A股策略信号', msg)
+        results.append('PushPlus成功' if ok else f'PushPlus失败:{detail}')
+    if sc_key:
+        ok, detail = send_serverchan(sc_key, 'A股策略信号', msg)
+        results.append('Server酱成功' if ok else f'Server酱失败:{detail}')
+    if not results:
+        return '自动推送已开启，但未配置通知Token。'
+    st.session_state.notification_last[key] = now.isoformat()
+    st.session_state.notification_log.append({
+        '时间': pd.Timestamp(china_now()).strftime('%Y-%m-%d %H:%M:%S'),
+        '代码': code, '动作': sig.action, '建议股数': int(qty), '结果': '；'.join(results)
+    })
+    _save_runtime_state()
+    return '；'.join(results)
 
 st.title(f'📈 A股主升浪雷达 V{APP_VERSION}')
-st.caption('状态机版｜15分钟防重复｜接回仅来自已执行高抛｜A股T+1可卖约束｜研究辅助，不构成投资建议')
+st.caption('实盘联调版｜真实成交确认自动同步持仓｜信号去重推送｜状态备份/恢复｜不自动下单｜研究辅助，不构成投资建议')
 
 with st.sidebar:
     st.header('⚙️ 行情与运行模式')
@@ -228,6 +351,7 @@ with st.sidebar:
         if add_code not in st.session_state.watch:
             st.session_state.watch.append(add_code)
             try_save_watchlist(st.session_state.watch)
+            _save_runtime_state()
         st.rerun()
     if c_clear.button('清空结果', use_container_width=True):
         st.session_state.pop('results', None)
@@ -243,7 +367,10 @@ with st.sidebar:
             st.session_state.sellable.pop(remove_code, None)
             st.session_state.trade_states.pop(remove_code, None)
             st.session_state.last_live_signal.pop(remove_code, None)
+            st.session_state.last_plan_qty.pop(remove_code, None)
+            st.session_state.last_plan_block.pop(remove_code, None)
             try_save_watchlist(st.session_state.watch)
+            _save_runtime_state()
             st.rerun()
         st.caption('当前：' + '、'.join(st.session_state.watch))
         st.download_button(
@@ -264,7 +391,7 @@ with st.sidebar:
     refresh = st.slider('刷新秒数', 30, 300, 60, 10)
 
     st.divider()
-    st.subheader('🎯 V2.3.2 策略参数')
+    st.subheader('🎯 V2.4.0 策略参数')
     strategy_style = st.selectbox(
         '策略风格', ['稳健', '均衡', '进攻'], index=1,
         help='进攻模式降低买点/加仓阈值；稳健模式提高阈值。高抛和风险退出阈值不会因进攻模式而明显放宽。',
@@ -296,11 +423,35 @@ with st.sidebar:
             f'{c} 持仓成本', min_value=0.0, step=0.01, format='%.3f',
             value=float(st.session_state.costs.get(c, 0.0)), key='cost_' + c,
         )
+    _save_runtime_state()
 
     st.divider()
     st.subheader('手机通知')
     pp = st.text_input('PushPlus Token', type='password', value=str(sec('PUSHPLUS_TOKEN', '')))
     sc = st.text_input('Server酱 SendKey', type='password', value=str(sec('SERVERCHAN_KEY', '')))
+    auto_notify = st.checkbox('符合条件时自动推送一次', False, help='只有页面正在运行/自动刷新并检测到新有效信号时才推送；不会后台独立运行。')
+    notify_cooldown = st.number_input('同类自动推送冷却（分钟）', min_value=15, max_value=240, value=60, step=15)
+
+    st.divider()
+    st.subheader('💾 实盘状态备份')
+    st.caption('云端运行时会自动保存临时快照；Streamlit重启/重新部署后不保证保留。正式使用请定期下载JSON备份。备份不包含任何API Token。')
+    st.download_button(
+        '⬇️ 下载持仓/状态备份',
+        data=snapshot_json(_snapshot_payload()),
+        file_name=f'a_share_state_{china_now().strftime("%Y%m%d_%H%M%S")}.json',
+        mime='application/json',
+        use_container_width=True,
+    )
+    state_upload = st.file_uploader('恢复状态备份(JSON)', type=['json'], key='state_restore_upload')
+    if state_upload is not None and st.button('♻️ 恢复这份状态备份', use_container_width=True):
+        try:
+            _apply_snapshot(parse_uploaded_snapshot(state_upload.getvalue()))
+            _save_runtime_state()
+            st.success('状态备份已恢复。')
+            st.rerun()
+        except Exception as e:
+            st.error(f'恢复失败：{e}')
+
     scan = st.button('🔄 立即扫描自选股', use_container_width=True)
 
 summary = provider_summary()
@@ -361,16 +512,17 @@ elif scan:
         try:
             m = fetch_minute(code, period)
             fresh = data_freshness(m, period, live=live_mode)
+            live_state = get_trade_state(code)
             s = analyze(
-                m, st.session_state.holdings.get(code, 0), market_score=regime['score'],
-                avg_cost=st.session_state.costs.get(code, 0.0), base_qty=base_qty, style=strategy_style,
-                sellable_holding=st.session_state.sellable.get(code, st.session_state.holdings.get(code, 0)),
-                state=get_trade_state(code).strategy_context(),
+                m, live_state.shares, market_score=regime['score'],
+                avg_cost=live_state.avg_cost, base_qty=base_qty, style=strategy_style,
+                sellable_holding=live_state.sellable,
+                state=live_state.strategy_context(),
             )
             if s:
                 safe_live = live_mode and not fresh['stale']
                 when = pd.Timestamp(m['datetime'].max())
-                state_info = get_trade_state(code)
+                state_info = live_state
                 guard = {'qty': 0, 'block': '', 'previous': st.session_state.last_live_signal.get(code, '—'), 'cooldown': 0, 'state': state_info}
                 if safe_live:
                     guard = evaluate_live_signal(code, s, when, base_qty, signal_cooldown, register=True)
@@ -413,12 +565,17 @@ elif scan:
                     '原因': ('数据过旧，已锁定交易数量；' if fresh['stale'] else '') + (guard['block'] + '；' if guard['block'] else '') + '；'.join(s.reason),
                 })
                 st.session_state.last_analysis[code] = s
+                st.session_state.last_plan_qty[code] = int(guard['qty'] if safe_live else 0)
+                st.session_state.last_plan_block[code] = str(guard['block'] or '')
+                if safe_live and guard['qty'] > 0:
+                    maybe_auto_notify(code, s, guard['qty'], when, auto_notify, int(notify_cooldown), pp, sc)
             else:
                 rows.append({'代码': code, '操作': '数据不足', '原因': f'{len(m)}根K线，策略至少需要30根'})
         except Exception as e:
             rows.append({'代码': code, '操作': '数据失败', '原因': friendly_error(e)})
         prog.progress((i + 1) / max(1, len(codes)))
     st.session_state.results = pd.DataFrame(rows)
+    _save_runtime_state()
 
 res = st.session_state.get('results', pd.DataFrame())
 if summary['watchlist_scan_enabled']:
@@ -481,19 +638,25 @@ else:
             try:
                 df = fetch_minute(pick, period)
                 fresh = data_freshness(df, period, live=live_mode)
+                live_state = get_trade_state(pick)
                 s = analyze(
-                    df, st.session_state.holdings.get(pick, 0), market_score=regime['score'],
-                    avg_cost=st.session_state.costs.get(pick, 0.0), base_qty=base_qty, style=strategy_style,
-                    sellable_holding=st.session_state.sellable.get(pick, st.session_state.holdings.get(pick, 0)),
-                    state=get_trade_state(pick).strategy_context(),
+                    df, live_state.shares, market_score=regime['score'],
+                    avg_cost=live_state.avg_cost, base_qty=base_qty, style=strategy_style,
+                    sellable_holding=live_state.sellable,
+                    state=live_state.strategy_context(),
                 )
                 if s:
                     st.session_state.last_analysis[pick] = s
                 if s:
                     safe_live = live_mode and not fresh['stale']
-                    guard = {'qty': 0, 'block': '', 'previous': st.session_state.last_live_signal.get(pick, '—'), 'cooldown': 0, 'state': get_trade_state(pick)}
+                    guard = {'qty': 0, 'block': '', 'previous': st.session_state.last_live_signal.get(pick, '—'), 'cooldown': 0, 'state': live_state}
                     if safe_live:
                         guard = evaluate_live_signal(pick, s, pd.Timestamp(df['datetime'].max()), base_qty, signal_cooldown, register=True)
+                    st.session_state.last_plan_qty[pick] = int(guard['qty'] if safe_live else 0)
+                    st.session_state.last_plan_block[pick] = str(guard['block'] or '')
+                    if safe_live and guard['qty'] > 0:
+                        maybe_auto_notify(pick, s, guard['qty'], pd.Timestamp(df['datetime'].max()), auto_notify, int(notify_cooldown), pp, sc)
+                    _save_runtime_state()
                     action_text = s.action if safe_live else (('数据延迟·' + s.action) if live_mode else ('复盘·' + s.action))
                     if safe_live and guard['block']:
                         action_text = '状态机保护·' + s.action
@@ -554,7 +717,7 @@ else:
 
 if codes:
     st.markdown('#### 🧭 状态机手动登记')
-    st.caption('只有你实际成交后才登记。登记用于防重复、接回前置条件和今日操作次数；真实持仓/可卖数量仍请在左侧同步修改。')
+    st.caption('只有实际成交后才确认。V2.4.0确认成交会自动同步总持仓、成本、T+1可卖和待接回，不再要求你手工二次修改持仓。')
     exec_code = st.selectbox('登记股票', codes, key='exec_code')
     last_sig = st.session_state.last_analysis.get(exec_code)
     state = get_trade_state(exec_code)
@@ -564,13 +727,20 @@ if codes:
     m3.metric('待接回', f'{state.sold_pool}股' if state.reentry_pending else '无')
     m4.metric('T+1可卖', f"{st.session_state.sellable.get(exec_code, 0)}股")
     if last_sig and last_sig.action_family != 'hold':
-        exec_qty = st.number_input('实际成交股数', min_value=0, step=100, value=max(0, int(last_sig.qty // 100) * 100), key='exec_qty')
+        exec_qty = st.number_input('实际成交股数', min_value=0, step=100, value=max(0, int(st.session_state.last_plan_qty.get(exec_code, last_sig.qty) // 100) * 100), key='exec_qty')
         exec_price = st.number_input('实际成交价', min_value=0.0, step=0.01, value=float(last_sig.price), format='%.3f', key='exec_price')
         if st.button(f'✅ 记录已执行：{last_sig.action}', use_container_width=False):
             st.success(confirm_plan_execution(exec_code, last_sig, exec_qty, exec_price))
             st.rerun()
     else:
         st.info('先执行一次“单股深度分析”或实时扫描，出现交易信号后再登记实际成交。')
+
+if st.session_state.execution_log:
+    with st.expander('📒 已确认成交记录', expanded=False):
+        st.dataframe(pd.DataFrame(st.session_state.execution_log[-100:]), use_container_width=True, hide_index=True)
+if st.session_state.notification_log:
+    with st.expander('📲 自动推送记录', expanded=False):
+        st.dataframe(pd.DataFrame(st.session_state.notification_log[-100:]), use_container_width=True, hide_index=True)
 
 bt_tab, api_tab, help_tab = st.tabs(['📊 历史回测', '🔐 API配置', f'📘 V{APP_VERSION}说明'])
 with bt_tab:
@@ -580,7 +750,7 @@ with bt_tab:
         df['datetime'] = pd.to_datetime(df['datetime'])
         sandbox_sig = analyze(df, holding=0, market_score=regime['score'], avg_cost=0.0, base_qty=base_qty, style=strategy_style)
         if sandbox_sig:
-            st.markdown('#### V2.3.2 策略沙盒：CSV最后一根K线')
+            st.markdown('#### V2.4.0 策略沙盒：CSV最后一根K线')
             q1, q2, q3, q4, q5, q6 = st.columns(6)
             q1.metric('动作', sandbox_sig.action)
             q2.metric('强度', sandbox_sig.strength)
@@ -632,10 +802,14 @@ PUSHPLUS_TOKEN = ""
 SERVERCHAN_KEY = ""
 ```
 
-V2.3.2 左侧可以临时一键切换 trial / paid。若希望重启后仍默认 paid，再把 Secrets 中的 `ALLTICK_ACCESS_MODE` 改成 `paid`。''')
+V2.4.0 左侧可以临时一键切换 trial / paid。若希望重启后仍默认 paid，再把 Secrets 中的 `ALLTICK_ACCESS_MODE` 改成 `paid`。''')
 
 with help_tab:
-    st.markdown('''### V2.3.2 交易语义修正版
+    st.markdown('''### V2.4.0 实盘联调版
+- **成交确认自动同步**：确认真实成交后，系统自动更新总持仓、持仓成本、T+1可卖、待接回和操作日志；仍然不会自动下单。
+- **状态备份/恢复**：运行时自动保存临时快照，并可下载/上传JSON备份；备份不保存API Token。Streamlit重启或重新部署前建议手动下载备份。
+- **自动推送去重**：可选择自动推送有效信号，同类信号默认60分钟内不重复推送；只有页面运行或自动刷新时才会检测。
+- **卖出数量不超计划**：高抛/减仓/风险退出按计划比例向下取整到100股整数手，避免500股×50%=250股却卖出300股。
 - **15分钟同类信号冷却**：首次触发后进入冷却，风险退出使用更短的5分钟保护，避免一分钟一条重复提醒。
 - **低吸最多两批**：本轮低吸总量不超过“本轮基准交易股数”；例如200股默认最多100+100，不再无限BUY。
 - **接回有前置条件**：只有你已确认执行过高抛并形成“待接回仓位”，接回评分才会启用；减仓/风险退出不会自动买回。
@@ -653,13 +827,13 @@ with help_tab:
 - **三种策略风格**：稳健 / 均衡 / 进攻。风格主要改变买点、加仓、接回阈值，不弱化风险保护。
 - **数量模型**：低吸按“本轮基准股数”拆批；加仓/接回受状态机次数与待接回仓位限制；卖出类同时受T+1可卖数量限制。
 - **通知升级**：六类非观察信号达到强度阈值后都可发送 PushPlus / Server酱。
-- **策略沙盒**：即使 AllTick Trial 不能访问自选A股，也可以上传分钟CSV验证V2.3.2状态机与六信号。
+- **策略沙盒**：即使 AllTick Trial 不能访问自选A股，也可以上传分钟CSV验证V2.4.0状态机与六信号。
 
 ### 仍然保留 V2.2.3 的保护
 北京时间、API缓存、429退避、604权限状态、Trial安全模式、网页管理自选股和分钟K数据新鲜度保护全部保留。
 
 ### 风险说明
-V2.3.2 是规则化研究辅助系统，不会自动下单。分钟级技术信号不能替代基本面、公告、涨跌停、流动性和重大事件判断。''')
+V2.4.0 是规则化研究辅助系统，不会自动下单。分钟级技术信号不能替代基本面、公告、涨跌停、流动性和重大事件判断。''')
 
 if auto and (summary['alltick_configured'] or summary['tushare_configured']):
     time.sleep(refresh)
