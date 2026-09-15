@@ -3,7 +3,41 @@ import numpy as np
 
 from indicators import add_indicators
 
-ENGINE_BUILD = "2.4.0.1-floor"
+ENGINE_BUILD = "2.5.0-param-oos"
+
+DEFAULT_STRATEGY_PARAMS = {
+    "buy_th": 70,
+    "add_th": 74,
+    "sell_th": 66,
+    "reentry_th": 70,
+    "reduce_th": 66,
+    "risk_th": 72,
+    "sell_pct_normal": 0.33,
+    "sell_pct_strong": 0.50,
+    "reduce_pct_normal": 0.33,
+    "reduce_pct_strong": 0.50,
+    "risk_pct_normal": 0.50,
+    "risk_pct_strong": 1.00,
+    "strong_sell_score": 88,
+    "strong_reduce_score": 82,
+    "strong_risk_score": 88,
+}
+
+
+def merge_strategy_params(params=None):
+    out = dict(DEFAULT_STRATEGY_PARAMS)
+    if isinstance(params, dict):
+        for k, v in params.items():
+            if k in out:
+                out[k] = v
+    # 基础安全边界，避免优化器生成荒谬参数。
+    for k in ("buy_th", "add_th", "sell_th", "reentry_th", "reduce_th", "risk_th",
+              "strong_sell_score", "strong_reduce_score", "strong_risk_score"):
+        out[k] = int(max(50, min(95, round(float(out[k])))))
+    for k in ("sell_pct_normal", "sell_pct_strong", "reduce_pct_normal", "reduce_pct_strong",
+              "risk_pct_normal", "risk_pct_strong"):
+        out[k] = float(max(0.10, min(1.00, float(out[k]))))
+    return out
 
 
 @dataclass
@@ -77,6 +111,9 @@ def analyze(
     style='均衡',
     state=None,
     sellable_holding=None,
+    params=None,
+    prepared=False,
+    row_index=None,
 ):
     """V2.3 多信号策略引擎。
 
@@ -86,11 +123,15 @@ def analyze(
     if df is None or len(df) < 30:
         return None
 
-    x = add_indicators(df)
+    cfg = merge_strategy_params(params)
+    x = df if prepared else add_indicators(df)
     if len(x) < 30:
         return None
-    r = x.iloc[-1]
-    prev = x.iloc[-2]
+    idx = len(x) - 1 if row_index is None else int(row_index)
+    if idx < 29 or idx >= len(x):
+        return None
+    r = x.iloc[idx]
+    prev = x.iloc[idx - 1]
 
     p = _finite(r.close)
     vwap = _finite(r.vwap, p)
@@ -315,12 +356,12 @@ def analyze(
     risk = _clamp(risk)
 
     # 触发阈值会随风格变化；进攻型更积极，稳健型更严格。
-    buy_th = 70 + style_shift
-    add_th = 74 + style_shift
-    reentry_th = 70 + style_shift
-    sell_th = 66  # 高抛不因进攻风格而过度推迟
-    reduce_th = 66 - style_shift // 2
-    risk_th = 72
+    buy_th = int(cfg['buy_th']) + style_shift
+    add_th = int(cfg['add_th']) + style_shift
+    reentry_th = int(cfg['reentry_th']) + style_shift
+    sell_th = int(cfg['sell_th'])  # 高抛不因进攻风格而过度推迟
+    reduce_th = int(cfg['reduce_th']) - style_shift // 2
+    risk_th = int(cfg['risk_th'])
 
     holding = max(0, int(holding or 0))
     lot = max(1, int(lot or 100))
@@ -352,7 +393,7 @@ def analyze(
         action_family = 'risk'
         if holding > 0:
             action = '风险退出候选'
-            pct = 1.0 if risk >= 88 else 0.5
+            pct = cfg['risk_pct_strong'] if risk >= cfg['strong_risk_score'] else cfg['risk_pct_normal']
             qty = _sell_qty(sellable_holding, pct, lot)
             qty_reason = f'风险分{risk}：按今日可卖{sellable_holding}股的{int(pct*100)}%退出，按{lot}股整数手向下取整，不超过计划比例'
         else:
@@ -361,7 +402,7 @@ def analyze(
     elif reduce >= reduce_th and holding > 0:
         action_family = 'reduce'
         action = '减仓候选'
-        reduce_pct = 0.33 if reduce < 82 else 0.5
+        reduce_pct = cfg['reduce_pct_normal'] if reduce < cfg['strong_reduce_score'] else cfg['reduce_pct_strong']
         qty = _sell_qty(sellable_holding, reduce_pct, lot)
         qty_reason = f'减仓分{reduce}：按今日可卖{sellable_holding}股的{int(reduce_pct*100)}%减仓，按{lot}股整数手向下取整，不超过计划比例'
         selected_reasons = reasons['reduce']
@@ -369,7 +410,7 @@ def analyze(
         action_family = 'sell'
         if holding > 0:
             action = '强高抛候选' if sell >= 82 else '高抛候选'
-            sell_pct = 0.50 if sell >= 88 else 0.33
+            sell_pct = cfg['sell_pct_strong'] if sell >= cfg['strong_sell_score'] else cfg['sell_pct_normal']
             qty = _sell_qty(sellable_holding, sell_pct, lot)
             qty_reason = f'高抛分{sell}：按今日可卖{sellable_holding}股的{int(sell_pct*100)}%做T，按{lot}股整数手向下取整，不超过计划比例'
         else:

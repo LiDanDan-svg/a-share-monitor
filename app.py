@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from alerts import send_pushplus, send_serverchan
-from backtest_v240 import backtest
+from backtest_v250 import backtest
 from data import (
     china_now,
     configure,
@@ -22,13 +22,15 @@ from data import (
     radar_candidates,
 )
 from strategy import analyze, ENGINE_BUILD
+from optimizer_v250 import optimize as optimize_v250
+from history_data import normalize_history_df, symbol_from_filename, split_by_symbol, quality_table, fetch_tushare_history
 from state_machine import TradeState, advance_day, apply_fill, cooldown_remaining, plan_qty, register_signal
 from portfolio_store import (
     build_snapshot, load_runtime_snapshot, parse_uploaded_snapshot,
     save_runtime_snapshot, snapshot_json, unpack_snapshot,
 )
 
-APP_VERSION = '2.4.0.2'
+APP_VERSION = '2.5.0'
 WATCHLIST_FILE = Path(__file__).with_name('watchlist.json')
 
 st.set_page_config(
@@ -302,7 +304,7 @@ def maybe_auto_notify(code, sig, qty, when, enabled, cooldown_minutes, pp_token,
     return '；'.join(results)
 
 st.title(f'📈 A股主升浪雷达 V{APP_VERSION}')
-st.caption('实盘联调版｜真实成交确认自动同步持仓｜信号去重推送｜状态备份/恢复｜不自动下单｜研究辅助，不构成投资建议')
+st.caption('真实历史验证版｜训练/验证/测试三段隔离｜优化Profit Factor与平均盈亏比｜保留实盘联调与手机推送｜不自动下单')
 st.caption(f'策略内核：{ENGINE_BUILD}｜卖出数量按计划比例向下取整到100股整数手')
 
 with st.sidebar:
@@ -392,7 +394,7 @@ with st.sidebar:
     refresh = st.slider('刷新秒数', 30, 300, 60, 10)
 
     st.divider()
-    st.subheader('🎯 V2.4.0.1 策略参数')
+    st.subheader('🎯 V2.5 策略参数')
     strategy_style = st.selectbox(
         '策略风格', ['稳健', '均衡', '进攻'], index=1,
         help='进攻模式降低买点/加仓阈值；稳健模式提高阈值。高抛和风险退出阈值不会因进攻模式而明显放宽。',
@@ -739,7 +741,7 @@ else:
 
 if codes:
     st.markdown('#### 🧭 状态机手动登记')
-    st.caption('只有实际成交后才确认。V2.4.0.1确认成交会自动同步总持仓、成本、T+1可卖和待接回，不再要求你手工二次修改持仓。')
+    st.caption('只有实际成交后才确认。V2.5.0确认成交会自动同步总持仓、成本、T+1可卖和待接回，不再要求你手工二次修改持仓。')
     exec_code = st.selectbox('登记股票', codes, key='exec_code')
     last_sig = st.session_state.last_analysis.get(exec_code)
     state = get_trade_state(exec_code)
@@ -764,7 +766,7 @@ if st.session_state.notification_log:
     with st.expander('📲 自动推送记录', expanded=False):
         st.dataframe(pd.DataFrame(st.session_state.notification_log[-100:]), use_container_width=True, hide_index=True)
 
-bt_tab, api_tab, help_tab = st.tabs(['📊 历史回测', '🔐 API配置', f'📘 V{APP_VERSION}说明'])
+bt_tab, research_tab, api_tab, help_tab = st.tabs(['📊 单文件回测', '🧪 V2.5真实历史验证', '🔐 API配置', f'📘 V{APP_VERSION}说明'])
 with bt_tab:
     up = st.file_uploader('上传分钟CSV：datetime,open,high,low,close,volume', type=['csv'])
     if up:
@@ -772,7 +774,7 @@ with bt_tab:
         df['datetime'] = pd.to_datetime(df['datetime'])
         sandbox_sig = analyze(df, holding=0, market_score=regime['score'], avg_cost=0.0, base_qty=base_qty, style=strategy_style)
         if sandbox_sig:
-            st.markdown('#### V2.4.0.1 策略沙盒：CSV最后一根K线')
+            st.markdown('#### V2.5 策略沙盒：CSV最后一根K线')
             q1, q2, q3, q4, q5, q6 = st.columns(6)
             q1.metric('动作', sandbox_sig.action)
             q2.metric('强度', sandbox_sig.strength)
@@ -809,6 +811,140 @@ with bt_tab:
             with st.expander('查看状态机拦截/冷却明细', expanded=False):
                 st.dataframe(bt['events'].tail(200), use_container_width=True, hide_index=True)
 
+with research_tab:
+    st.markdown('### 🧪 真实历史样本外验证 / 参数优化')
+    st.info(
+        '目标不是在历史数据里硬凑一个漂亮数字，而是：**训练集找方向 → 验证集选参数 → 测试集只验收一次**。'
+        '只有未参与选参的测试集同时满足 Profit Factor > 1、平均盈亏比 > 1、收益为正和最低交易数，系统才标记“通过”。'
+    )
+    st.caption('Profit Factor = 总盈利 / 总亏损；平均盈亏比 = 平均盈利单 / 平均亏损单。单纯追求极大PF很容易过拟合，因此优化器会限制参数自由度、惩罚少交易和大回撤。')
+
+    source_mode = st.radio('历史数据来源', ['上传真实分钟CSV', 'Tushare历史分钟（需相应权限）'], horizontal=True, key='v250_source_mode')
+    datasets = {}
+
+    if source_mode == '上传真实分钟CSV':
+        hist_files = st.file_uploader(
+            '可一次上传多只股票CSV；字段至少包含 datetime/open/high/low/close/volume。文件名最好带6位股票代码。',
+            type=['csv'], accept_multiple_files=True, key='v250_history_files'
+        )
+        if hist_files:
+            try:
+                merged = {}
+                for idx, f in enumerate(hist_files, start=1):
+                    raw = pd.read_csv(f)
+                    fallback = symbol_from_filename(f.name, f'DATA{idx}')
+                    parts = split_by_symbol(raw, fallback)
+                    for sym, d in parts.items():
+                        if sym in merged:
+                            merged[sym] = pd.concat([merged[sym], d], ignore_index=True).drop_duplicates('datetime').sort_values('datetime').reset_index(drop=True)
+                        else:
+                            merged[sym] = d
+                datasets = merged
+                st.session_state['v250_datasets'] = datasets
+            except Exception as exc:
+                st.error(f'历史CSV读取失败：{exc}')
+    else:
+        c1, c2, c3 = st.columns([2, 1, 1])
+        default_codes = ','.join(st.session_state.watch[:9])
+        hist_codes = c1.text_input('股票代码（逗号分隔）', value=default_codes, key='v250_ts_codes')
+        default_end = china_now().date() - pd.Timedelta(days=1)
+        default_start = default_end - pd.Timedelta(days=180)
+        hist_start = c2.date_input('开始日期', value=default_start, key='v250_start')
+        hist_end = c3.date_input('结束日期', value=default_end, key='v250_end')
+        hist_freq = st.selectbox('历史分钟级别', ['5min', '15min', '1min'], index=0, key='v250_freq', help='参数优化优先建议5分钟：样本更长、噪声更低、计算更快。')
+        if st.button('⬇️ 拉取 Tushare 真实历史分钟', use_container_width=True, key='v250_fetch_ts'):
+            code_list = [normalize_code(x) for x in hist_codes.replace('，', ',').split(',')]
+            code_list = [x for x in code_list if x]
+            if not tushare_token:
+                st.error('请先在左侧填写 Tushare Token。历史分钟还需要Tushare对应分钟权限。')
+            elif not code_list:
+                st.error('请至少填写一只股票代码。')
+            else:
+                pulled = {}
+                prog = st.progress(0.0, text='开始拉取历史分钟…')
+                try:
+                    for i, code in enumerate(code_list):
+                        prog.progress(i / max(1, len(code_list)), text=f'正在拉取 {code}…')
+                        pulled[code] = fetch_tushare_history(tushare_token, code, hist_start, hist_end, hist_freq)
+                    prog.progress(1.0, text='历史分钟拉取完成')
+                    st.session_state['v250_datasets'] = pulled
+                    st.success(f'已获取 {len(pulled)} 只股票的真实历史分钟数据。')
+                except Exception as exc:
+                    st.error(str(exc))
+
+        datasets = st.session_state.get('v250_datasets', {})
+
+    if datasets:
+        st.markdown('#### 数据质量')
+        st.dataframe(quality_table(datasets), use_container_width=True, hide_index=True)
+        total_days = sum(pd.to_datetime(d['datetime']).dt.date.nunique() for d in datasets.values())
+        if total_days < 45:
+            st.warning('样本偏短。功能可以运行，但不要依据短样本结果投入真实资金；建议至少3~6个月，最好覆盖上涨、震荡和调整阶段。')
+
+        st.markdown('#### 优化约束')
+        o1, o2, o3, o4 = st.columns(4)
+        candidate_count = o1.number_input('候选参数组数', min_value=10, max_value=300, value=40, step=10, key='v250_candidates')
+        min_valid_exits = o2.number_input('验证集最低卖出样本数', min_value=3, max_value=100, value=8, step=1, key='v250_min_exits')
+        max_dd_limit = o3.number_input('允许最差单标的回撤(%)', min_value=5.0, max_value=50.0, value=25.0, step=1.0, key='v250_dd_limit')
+        opt_market_score = o4.slider('回测市场环境基准分', 20, 80, 55, 5, key='v250_market_score')
+        st.caption('固定使用 60%训练 / 20%验证 / 20%测试。**测试集不参与参数选择**，避免为了“PF>1”把测试集也调坏成过拟合。')
+
+        if st.button('🚀 开始样本外优化', type='primary', use_container_width=True, key='v250_optimize'):
+            try:
+                with st.spinner('正在运行训练/验证搜索，并在最后一次性检查测试集…'):
+                    result = optimize_v250(
+                        datasets, candidate_count=int(candidate_count), seed=250,
+                        train_ratio=0.60, valid_ratio=0.20,
+                        min_valid_exits=int(min_valid_exits), max_dd_limit=float(max_dd_limit),
+                        initial_cash=100000, base_qty=int(base_qty), style=strategy_style,
+                        market_score=int(opt_market_score),
+                    )
+                st.session_state['v250_result'] = result
+            except Exception as exc:
+                st.error(f'优化失败：{exc}')
+
+        result = st.session_state.get('v250_result')
+        if result:
+            test = result['test']
+            val = result['best_validation']
+            if result['qualified']:
+                st.success('✅ 样本外验收通过：未参与选参的测试集同时满足 PF>1、平均盈亏比>1、收益为正和交易数约束。仍需小资金前向验证，不能视为未来盈利保证。')
+            else:
+                st.error('❌ 样本外验收未通过：系统不会因为训练/验证数据漂亮就宣称策略可用。建议增加真实样本、降低自由度或重新设计规则。')
+
+            st.markdown('#### 未见测试集前的最佳验证结果')
+            v1, v2, v3, v4, v5 = st.columns(5)
+            v1.metric('验证PF', f"{float(val['valid_pf']):.2f}")
+            v2.metric('验证平均盈亏比', f"{float(val['valid_payoff']):.2f}")
+            v3.metric('验证收益', f"{float(val['valid_return_pct']):.2f}%")
+            v4.metric('验证最差回撤', f"{float(val['valid_max_dd_pct']):.2f}%")
+            v5.metric('验证卖出样本', int(val['valid_exits']))
+
+            st.markdown('#### 最终测试集（真正样本外）')
+            t1, t2, t3, t4, t5, t6 = st.columns(6)
+            t1.metric('测试PF', f"{float(test['profit_factor']):.2f}")
+            t2.metric('测试平均盈亏比', f"{float(test['payoff_ratio']):.2f}")
+            t3.metric('测试收益', f"{float(test['return_pct']):.2f}%")
+            t4.metric('测试最差回撤', f"{float(test['max_drawdown_pct']):.2f}%")
+            t5.metric('测试胜率', f"{float(test['win_rate']):.1f}%")
+            t6.metric('测试卖出样本', int(test['exit_count']))
+
+            st.markdown('#### 最优参数（仅当测试集通过后才值得进入前向验证）')
+            st.dataframe(result['params_table'], use_container_width=True, hide_index=True)
+            st.download_button(
+                '⬇️ 下载最优策略参数 JSON',
+                data=json.dumps(result['profile'], ensure_ascii=False, indent=2),
+                file_name='v250_strategy_profile.json', mime='application/json', use_container_width=True,
+            )
+
+            if not result['test_per_symbol'].empty:
+                st.markdown('#### 测试集逐股票稳定性')
+                st.dataframe(result['test_per_symbol'], use_container_width=True, hide_index=True)
+            with st.expander('查看候选参数排名（按验证集目标函数，不看测试集）', expanded=False):
+                st.dataframe(result['ranking'].head(30), use_container_width=True, hide_index=True)
+    else:
+        st.info('先上传真实历史分钟CSV，或使用有历史分钟权限的Tushare拉取数据。没有真实历史数据时，本页不会给出“盈利概率”或虚构的准确率。')
+
 with api_tab:
     st.markdown('''### Streamlit Secrets 建议配置
 真实 Token **不要上传到 GitHub**：
@@ -824,10 +960,10 @@ PUSHPLUS_TOKEN = ""
 SERVERCHAN_KEY = ""
 ```
 
-V2.4.0.1 左侧可以临时一键切换 trial / paid。若希望重启后仍默认 paid，再把 Secrets 中的 `ALLTICK_ACCESS_MODE` 改成 `paid`。''')
+V2.5.0 左侧可以临时一键切换 trial / paid。若希望重启后仍默认 paid，再把 Secrets 中的 `ALLTICK_ACCESS_MODE` 改成 `paid`。''')
 
 with help_tab:
-    st.markdown('''### V2.4.0.1 实盘联调版
+    st.markdown('''### V2.5.0 真实历史验证版
 - **成交确认自动同步**：确认真实成交后，系统自动更新总持仓、持仓成本、T+1可卖、待接回和操作日志；仍然不会自动下单。
 - **状态备份/恢复**：运行时自动保存临时快照，并可下载/上传JSON备份；备份不保存API Token。Streamlit重启或重新部署前建议手动下载备份。
 - **自动推送去重**：可选择自动推送有效信号，同类信号默认60分钟内不重复推送；只有页面运行或自动刷新时才会检测。
@@ -849,13 +985,21 @@ with help_tab:
 - **三种策略风格**：稳健 / 均衡 / 进攻。风格主要改变买点、加仓、接回阈值，不弱化风险保护。
 - **数量模型**：低吸按“本轮基准股数”拆批；加仓/接回受状态机次数与待接回仓位限制；卖出类同时受T+1可卖数量限制。
 - **通知升级**：六类非观察信号达到强度阈值后都可发送 PushPlus / Server酱。
-- **策略沙盒**：即使 AllTick Trial 不能访问自选A股，也可以上传分钟CSV验证V2.4.0.1状态机与六信号。
+- **策略沙盒**：即使 AllTick Trial 不能访问自选A股，也可以上传分钟CSV验证V2.5.0状态机与六信号。
 
 ### 仍然保留 V2.2.3 的保护
 北京时间、API缓存、429退避、604权限状态、Trial安全模式、网页管理自选股和分钟K数据新鲜度保护全部保留。
 
+### V2.5 新增：真实历史样本外验证
+- 多股票真实分钟CSV批量导入；也支持有权限的Tushare历史分钟。
+- 60%训练 / 20%验证 / 20%测试严格按时间切分。
+- 参数只允许看训练与验证；测试集最后一次性验收，防止“为了PF>1偷看测试集”。
+- 同时统计 Profit Factor、平均盈亏比、胜率、期望值、收益、最大回撤与交易数。
+- 优化目标偏向高PF和高盈亏比，但会惩罚少交易、大回撤和单股票偶然性。
+- 测试集PF<=1或平均盈亏比<=1时明确判定“不通过”，不自动把历史最优参数投入实盘。
+
 ### 风险说明
-V2.4.0.1 是规则化研究辅助系统，不会自动下单。分钟级技术信号不能替代基本面、公告、涨跌停、流动性和重大事件判断。''')
+V2.5.0 是规则化研究辅助系统，不会自动下单。历史PF>1不代表未来仍>1；必须再做前向验证、小资金验证，并考虑公告、涨跌停、流动性、复权和重大事件。''')
 
 if auto and (summary['alltick_configured'] or summary['tushare_configured']):
     time.sleep(refresh)
