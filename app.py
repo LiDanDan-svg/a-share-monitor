@@ -28,7 +28,7 @@ from portfolio_store import (
     save_runtime_snapshot, snapshot_json, unpack_snapshot,
 )
 
-APP_VERSION = '2.4.0.1'
+APP_VERSION = '2.4.0.2'
 WATCHLIST_FILE = Path(__file__).with_name('watchlist.json')
 
 st.set_page_config(
@@ -430,6 +430,27 @@ with st.sidebar:
     st.subheader('手机通知')
     pp = st.text_input('PushPlus Token', type='password', value=str(sec('PUSHPLUS_TOKEN', '')))
     sc = st.text_input('Server酱 SendKey', type='password', value=str(sec('SERVERCHAN_KEY', '')))
+
+    if st.button('📱 发送 PushPlus 测试通知', use_container_width=True):
+        if not pp:
+            st.warning('请先填写 PushPlus Token。')
+        else:
+            test_time = china_now().strftime('%Y-%m-%d %H:%M:%S')
+            ok, detail = send_pushplus(
+                pp,
+                'A股主升浪雷达｜通知测试',
+                (
+                    f'PushPlus 通知链路测试成功。<br>'
+                    f'系统版本：V{APP_VERSION}<br>'
+                    f'北京时间：{test_time}<br>'
+                    f'这是一条测试消息，不是交易信号。'
+                ),
+            )
+            if ok:
+                st.success('测试通知已发送，请查看微信/PushPlus 接收端。')
+            else:
+                st.error(f'测试通知发送失败：{detail}')
+
     auto_notify = st.checkbox('符合条件时自动推送一次', False, help='只有页面正在运行/自动刷新并检测到新有效信号时才推送；不会后台独立运行。')
     notify_cooldown = st.number_input('同类自动推送冷却（分钟）', min_value=15, max_value=240, value=60, step=15)
 
