@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from alerts import send_pushplus, send_serverchan
-from backtest_v2311 import backtest
+from backtest_v232 import backtest
 from data import (
     china_now,
     configure,
@@ -24,7 +24,7 @@ from data import (
 from strategy import analyze
 from state_machine import TradeState, advance_day, cooldown_remaining, plan_qty, register_signal
 
-APP_VERSION = '2.3.1.1'
+APP_VERSION = '2.3.2'
 WATCHLIST_FILE = Path(__file__).with_name('watchlist.json')
 
 st.set_page_config(
@@ -140,7 +140,7 @@ def confirm_plan_execution(code, sig, qty, price):
         state.buy_count += 1
     elif family == 'add':
         state.add_count += 1
-    elif family in {'sell', 'reduce'}:
+    elif family == 'sell':
         qty = min(qty, state.sellable)
         if qty <= 0:
             return 'T+1限制：当前可卖股数为0，未记录。'
@@ -149,6 +149,16 @@ def confirm_plan_execution(code, sig, qty, price):
         state.last_sell_price = float(price)
         state.reentry_low = float(sig.reentry_low)
         state.reentry_high = float(sig.reentry_high)
+    elif family == 'reduce':
+        qty = min(qty, state.sellable)
+        if qty <= 0:
+            return 'T+1限制：当前可卖股数为0，未记录。'
+        # 减仓是风险管理，不建立待接回；并取消已有的做T接回计划。
+        state.reentry_pending = False
+        state.sold_pool = 0
+        state.last_sell_price = 0.0
+        state.reentry_low = 0.0
+        state.reentry_high = 0.0
     elif family == 'reentry':
         qty = min(qty, state.sold_pool)
         state.sold_pool = max(0, state.sold_pool - qty)
@@ -158,6 +168,9 @@ def confirm_plan_execution(code, sig, qty, price):
     elif family == 'risk':
         state.reentry_pending = False
         state.sold_pool = 0
+        state.last_sell_price = 0.0
+        state.reentry_low = 0.0
+        state.reentry_high = 0.0
     else:
         return '当前不是需要记录成交的交易信号。'
     state.ops_today += 1
@@ -166,7 +179,7 @@ def confirm_plan_execution(code, sig, qty, price):
     return f'已记录：{sig.action} {qty}股。请同步更新左侧真实持仓/可卖股数。'
 
 st.title(f'📈 A股主升浪雷达 V{APP_VERSION}')
-st.caption('状态机版｜15分钟防重复｜接回需前置高抛/减仓｜A股T+1可卖约束｜研究辅助，不构成投资建议')
+st.caption('状态机版｜15分钟防重复｜接回仅来自已执行高抛｜A股T+1可卖约束｜研究辅助，不构成投资建议')
 
 with st.sidebar:
     st.header('⚙️ 行情与运行模式')
@@ -251,7 +264,7 @@ with st.sidebar:
     refresh = st.slider('刷新秒数', 30, 300, 60, 10)
 
     st.divider()
-    st.subheader('🎯 V2.3.1 策略参数')
+    st.subheader('🎯 V2.3.2 策略参数')
     strategy_style = st.selectbox(
         '策略风格', ['稳健', '均衡', '进攻'], index=1,
         help='进攻模式降低买点/加仓阈值；稳健模式提高阈值。高抛和风险退出阈值不会因进攻模式而明显放宽。',
@@ -391,6 +404,7 @@ elif scan:
                     'RSI': round(s.rsi, 1),
                     '量比': round(s.vol_ratio, 2),
                     '建议股数': guard['qty'] if safe_live else 0,
+                    '数量依据': s.qty_reason,
                     '可卖股数': int(st.session_state.sellable.get(code, 0)),
                     '接回区间': f'{s.reentry_low:.2f}~{s.reentry_high:.2f}',
                     '失效价': round(s.invalid, 3),
@@ -499,7 +513,8 @@ else:
                         f"乖离 **{s.dev:.2f}%**｜量比 **{s.vol_ratio:.2f}**｜动量 **{s.momentum_score}/100**"
                     )
                     st.write(
-                        f"建议数量 **{guard['qty'] if safe_live else 0}股**｜接回区间 **{s.reentry_low:.2f}～{s.reentry_high:.2f}**｜"
+                        f"建议数量 **{guard['qty'] if safe_live else 0}股**｜数量依据 **{s.qty_reason}**｜"
+                        f"接回区间 **{s.reentry_low:.2f}～{s.reentry_high:.2f}**｜"
                         f"结构失效 **{s.invalid:.2f}**｜风险退出参考 **{s.stop_price:.2f}**｜突破参考 **{s.breakout_price:.2f}**"
                     )
                     st.write(
@@ -524,7 +539,7 @@ else:
                             f'趋势 {s.trend_score} / 动量 {s.momentum_score}<br>'
                             f'买点 {s.buy_score} / 加仓 {s.add_score} / 高抛 {s.sell_score} / 接回 {s.reentry_score}<br>'
                             f'减仓 {s.reduce_score} / 风险 {s.risk_score}<br>'
-                            f'建议 {guard["qty"]}股<br>接回区间 {s.reentry_low:.2f}-{s.reentry_high:.2f}<br>'
+                            f'建议 {guard["qty"]}股<br>数量依据 {s.qty_reason}<br>接回区间 {s.reentry_low:.2f}-{s.reentry_high:.2f}<br>'
                             f'结构失效 {s.invalid:.2f} / 风险退出参考 {s.stop_price:.2f}'
                         )
                         x, y = st.columns(2)
@@ -565,7 +580,7 @@ with bt_tab:
         df['datetime'] = pd.to_datetime(df['datetime'])
         sandbox_sig = analyze(df, holding=0, market_score=regime['score'], avg_cost=0.0, base_qty=base_qty, style=strategy_style)
         if sandbox_sig:
-            st.markdown('#### V2.3.1.1 策略沙盒：CSV最后一根K线')
+            st.markdown('#### V2.3.2 策略沙盒：CSV最后一根K线')
             q1, q2, q3, q4, q5, q6 = st.columns(6)
             q1.metric('动作', sandbox_sig.action)
             q2.metric('强度', sandbox_sig.strength)
@@ -574,6 +589,7 @@ with bt_tab:
             q5.metric('抛/接', f'{sandbox_sig.sell_score}/{sandbox_sig.reentry_score}')
             q6.metric('减/险', f'{sandbox_sig.reduce_score}/{sandbox_sig.risk_score}')
             st.caption('；'.join(sandbox_sig.reason) if sandbox_sig.reason else '暂无强触发条件')
+            st.info(f'数量模型：{sandbox_sig.qty_reason}')
         init = st.number_input('初始现金', 10000, 10000000, 100000, 10000)
         b1, b2 = st.columns(2)
         initial_holding = b1.number_input('回测开始前已有底仓股数', min_value=0, max_value=1000000, value=0, step=100, help='已有底仓视为隔夜仓，当天可卖。测试高抛/接回时可填1000股。')
@@ -616,32 +632,34 @@ PUSHPLUS_TOKEN = ""
 SERVERCHAN_KEY = ""
 ```
 
-V2.3.1 左侧可以临时一键切换 trial / paid。若希望重启后仍默认 paid，再把 Secrets 中的 `ALLTICK_ACCESS_MODE` 改成 `paid`。''')
+V2.3.2 左侧可以临时一键切换 trial / paid。若希望重启后仍默认 paid，再把 Secrets 中的 `ALLTICK_ACCESS_MODE` 改成 `paid`。''')
 
 with help_tab:
-    st.markdown('''### V2.3.1 状态机策略引擎
+    st.markdown('''### V2.3.2 交易语义修正版
 - **15分钟同类信号冷却**：首次触发后进入冷却，风险退出使用更短的5分钟保护，避免一分钟一条重复提醒。
 - **低吸最多两批**：本轮低吸总量不超过“本轮基准交易股数”；例如200股默认最多100+100，不再无限BUY。
-- **接回有前置条件**：只有你已确认执行过高抛/减仓并形成“待接回仓位”，接回评分才会启用。
+- **接回有前置条件**：只有你已确认执行过高抛并形成“待接回仓位”，接回评分才会启用；减仓/风险退出不会自动买回。
 - **加仓次数上限**：同一轮加仓最多1次，并且必须已有底仓；无底仓不会把突破信号误叫“加仓”。
 - **A股T+1**：新增“今日可卖股数”，高抛/减仓/风险退出均不会超过可卖数量；回测跨日后才解锁当天买入股份。
 - **手动成交确认**：实盘信号出现后，可在“状态机手动登记”里记录已执行成交，驱动待接回、操作次数等状态。
 - **六类信号并行评分**：买点、加仓、高抛、接回、减仓、风险退出，各自0～100分。
 - **趋势 + 动量双评分**：MA结构、MA20斜率、MACD柱、短周期收益、VWAP位置共同决定。
 - **动态接回区间**：根据当日VWAP和ATR波动自动生成，不再只给一个固定接回价。
-- **高抛与风险退出分离**：趋势仍强但过热叫“高抛”；趋势破坏则转为“减仓/风险退出”。
+- **高抛/减仓/风险退出语义分离**：高抛是计划性做T并产生待接回；减仓与风险退出属于风险管理，不产生待接回。
+- **风险优先级最高**：同一根K同时满足风险、减仓、高抛时，优先执行风险退出，其次减仓，最后才是高抛。
+- **数量解释**：每个交易信号显示建议数量的计算依据（可卖比例、基准数量、待接回数量及整数手规则）。
 - **突破加仓识别**：20K前高 + 量能确认 + 主升趋势，用于识别分歧转一致后的加速。
 - **持仓成本辅助**：成本可选；只有“浮亏 + 趋势破坏”同时出现时才额外提高风险分，不会仅因浮亏机械止损。
 - **三种策略风格**：稳健 / 均衡 / 进攻。风格主要改变买点、加仓、接回阈值，不弱化风险保护。
 - **数量模型**：低吸按“本轮基准股数”拆批；加仓/接回受状态机次数与待接回仓位限制；卖出类同时受T+1可卖数量限制。
 - **通知升级**：六类非观察信号达到强度阈值后都可发送 PushPlus / Server酱。
-- **策略沙盒**：即使 AllTick Trial 不能访问自选A股，也可以上传分钟CSV验证V2.3.1状态机与六信号。
+- **策略沙盒**：即使 AllTick Trial 不能访问自选A股，也可以上传分钟CSV验证V2.3.2状态机与六信号。
 
 ### 仍然保留 V2.2.3 的保护
 北京时间、API缓存、429退避、604权限状态、Trial安全模式、网页管理自选股和分钟K数据新鲜度保护全部保留。
 
 ### 风险说明
-V2.3.1 是规则化研究辅助系统，不会自动下单。分钟级技术信号不能替代基本面、公告、涨跌停、流动性和重大事件判断。''')
+V2.3.2 是规则化研究辅助系统，不会自动下单。分钟级技术信号不能替代基本面、公告、涨跌停、流动性和重大事件判断。''')
 
 if auto and (summary['alltick_configured'] or summary['tushare_configured']):
     time.sleep(refresh)

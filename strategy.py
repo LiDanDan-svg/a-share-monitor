@@ -35,6 +35,7 @@ class Signal:
     breakout_price: float
     cost_pnl_pct: float
     style: str
+    qty_reason: str
 
 
 def _finite(v, default=0.0):
@@ -251,7 +252,7 @@ def analyze(
             reentry -= 15
         last_sell_price = _finite(state.get('last_sell_price', 0), 0)
         if last_sell_price > 0 and p >= last_sell_price:
-            reentry -= 28; reasons['reentry'].append('尚未低于上次高抛/减仓成交价')
+            reentry -= 28; reasons['reentry'].append('尚未低于上次高抛成交价')
         plan_low = _finite(state.get('reentry_low', 0), 0)
         plan_high = _finite(state.get('reentry_high', 0), 0)
         if plan_low > 0 and plan_high > 0:
@@ -260,7 +261,7 @@ def analyze(
             elif p > plan_high * 1.02:
                 reentry -= 12
     else:
-        reasons['reentry'].append('无已执行高抛/减仓记录，不生成接回信号')
+        reasons['reentry'].append('无已执行高抛记录，不生成接回信号')
 
     # ---------- 减仓：结构走弱，但尚未达到硬性退出 ----------
     reduce = 0
@@ -337,10 +338,11 @@ def analyze(
     breakout_price = prev_high20 if prev_high20 > 0 else p
 
     # 动作优先级：风险退出 > 减仓 > 高抛 > 加仓 > 接回 > 买点 > 持有/观察。
-    # 接回只在状态机确认之前确实执行过高抛/减仓后才有资格出现。
+    # 接回只在状态机确认之前确实执行过高抛后才有资格出现。
     action_family = 'hold'
     action = '持有/观察'
     qty = 0
+    qty_reason = '观察信号，不建议交易数量'
     selected_reasons = []
 
     if risk >= risk_th:
@@ -349,36 +351,46 @@ def analyze(
             action = '风险退出候选'
             pct = 1.0 if risk >= 88 else 0.5
             qty = _sell_qty(sellable_holding, pct, lot)
+            qty_reason = f'风险分{risk}：按今日可卖{sellable_holding}股的{int(pct*100)}%退出，按{lot}股整数手取整'
         else:
             action = '风险回避'
         selected_reasons = reasons['risk']
     elif reduce >= reduce_th and holding > 0:
         action_family = 'reduce'
         action = '减仓候选'
-        qty = _sell_qty(sellable_holding, 0.33 if reduce < 82 else 0.5, lot)
+        reduce_pct = 0.33 if reduce < 82 else 0.5
+        qty = _sell_qty(sellable_holding, reduce_pct, lot)
+        qty_reason = f'减仓分{reduce}：按今日可卖{sellable_holding}股的{int(reduce_pct*100)}%减仓，按{lot}股整数手向上取整'
         selected_reasons = reasons['reduce']
     elif sell >= sell_th:
         action_family = 'sell'
         if holding > 0:
             action = '强高抛候选' if sell >= 82 else '高抛候选'
-            qty = _sell_qty(sellable_holding, 0.50 if sell >= 88 else 0.33, lot)
+            sell_pct = 0.50 if sell >= 88 else 0.33
+            qty = _sell_qty(sellable_holding, sell_pct, lot)
+            qty_reason = f'高抛分{sell}：按今日可卖{sellable_holding}股的{int(sell_pct*100)}%做T，按{lot}股整数手向上取整'
         else:
             action = '过热·不追'
         selected_reasons = reasons['sell']
     elif add >= add_th and holding > 0:
         action_family = 'add'
         action = '主升加仓候选'
-        qty = base_qty * (2 if add >= 88 and style == '进攻' else 1)
+        add_mult = 2 if add >= 88 and style == '进攻' else 1
+        qty = base_qty * add_mult
+        qty_reason = f'加仓分{add}：以本轮基准{base_qty}股×{add_mult}计算；状态机再限制为本轮最多1次'
         selected_reasons = reasons['add']
     elif reentry >= reentry_th and reentry_allowed:
         action_family = 'reentry'
         action = '接回候选'
-        qty = min(base_qty, int(state.get('sold_pool', base_qty) or base_qty))
+        pending_qty = int(state.get('sold_pool', base_qty) or base_qty)
+        qty = min(base_qty, pending_qty)
+        qty_reason = f'接回分{reentry}：待接回{pending_qty}股，与本轮基准{base_qty}股取较小值'
         selected_reasons = reasons['reentry']
     elif buy >= buy_th:
         action_family = 'buy'
         action = '低吸买点候选'
         qty = base_qty
+        qty_reason = f'买点分{buy}：本轮低吸总额度{base_qty}股；状态机默认最多拆2批执行'
         selected_reasons = reasons['buy']
     elif trend_score >= 60 and market_score >= 45:
         action_family = 'hold'
@@ -424,4 +436,5 @@ def analyze(
         breakout_price=float(breakout_price),
         cost_pnl_pct=float(cost_pnl_pct),
         style=style,
+        qty_reason=qty_reason,
     )

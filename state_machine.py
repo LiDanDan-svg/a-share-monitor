@@ -106,7 +106,7 @@ def plan_qty(
 
     buy：一轮低吸最多使用 base_qty，总共最多2次；默认分两批。
     add：一轮最多一次，必须已有持仓。
-    reentry：只能回补之前高抛/减仓产生的 sold_pool。
+    reentry：只能回补之前已执行高抛产生的 sold_pool。
     卖出类：只能卖 sellable，落实 A股 T+1。
     """
     family = str(family or '')
@@ -135,7 +135,7 @@ def plan_qty(
 
     if family == 'reentry':
         if not state.reentry_pending or state.sold_pool < lot:
-            return 0, '没有已执行高抛/减仓形成的待接回仓位'
+            return 0, '没有已执行高抛形成的待接回仓位'
         qty = min(_round_lot(suggested_qty or base_qty, lot), _round_lot(state.sold_pool, lot))
         return (qty, '') if qty >= lot else (0, '待接回仓位不足一手')
 
@@ -186,15 +186,20 @@ def apply_fill(
         qty = min(qty, state.shares, state.sellable)
         state.shares -= qty
         state.sellable -= qty
-        if family in {'sell', 'reduce'}:
+        if family == 'sell':
+            # 只有“高抛”属于计划性做T，才建立待接回仓位。
             state.sold_pool += qty
             state.reentry_pending = True
             state.last_sell_price = price
             state.reentry_low = float(reentry_low or 0.0)
             state.reentry_high = float(reentry_high or 0.0)
         else:
+            # 减仓/风险退出是风险管理，不默认计划买回；若之前有高抛待接回，也一并取消。
             state.reentry_pending = False
             state.sold_pool = 0
+            state.last_sell_price = 0.0
+            state.reentry_low = 0.0
+            state.reentry_high = 0.0
         if state.shares <= 0:
             state.shares = 0
             state.sellable = 0
