@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from alerts import send_pushplus, send_serverchan
-from backtest import backtest
+from backtest_v2311 import backtest
 from data import (
     china_now,
     configure,
@@ -24,7 +24,7 @@ from data import (
 from strategy import analyze
 from state_machine import TradeState, advance_day, cooldown_remaining, plan_qty, register_signal
 
-APP_VERSION = '2.3.1'
+APP_VERSION = '2.3.1.1'
 WATCHLIST_FILE = Path(__file__).with_name('watchlist.json')
 
 st.set_page_config(
@@ -565,7 +565,7 @@ with bt_tab:
         df['datetime'] = pd.to_datetime(df['datetime'])
         sandbox_sig = analyze(df, holding=0, market_score=regime['score'], avg_cost=0.0, base_qty=base_qty, style=strategy_style)
         if sandbox_sig:
-            st.markdown('#### V2.3.1 策略沙盒：CSV最后一根K线')
+            st.markdown('#### V2.3.1.1 策略沙盒：CSV最后一根K线')
             q1, q2, q3, q4, q5, q6 = st.columns(6)
             q1.metric('动作', sandbox_sig.action)
             q2.metric('强度', sandbox_sig.strength)
