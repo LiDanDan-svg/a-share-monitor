@@ -22,8 +22,9 @@ from data import (
     radar_candidates,
 )
 from strategy import analyze
+from state_machine import TradeState, advance_day, cooldown_remaining, plan_qty, register_signal
 
-APP_VERSION = '2.3.0'
+APP_VERSION = '2.3.1'
 WATCHLIST_FILE = Path(__file__).with_name('watchlist.json')
 
 st.set_page_config(
@@ -83,13 +84,89 @@ if 'holdings' not in st.session_state:
     st.session_state.holdings = {}
 if 'costs' not in st.session_state:
     st.session_state.costs = {}
+if 'sellable' not in st.session_state:
+    st.session_state.sellable = {}
+if 'trade_states' not in st.session_state:
+    st.session_state.trade_states = {}
+if 'last_live_signal' not in st.session_state:
+    st.session_state.last_live_signal = {}
+if 'last_analysis' not in st.session_state:
+    st.session_state.last_analysis = {}
 if st.session_state.get('_app_version') != APP_VERSION:
     st.session_state['_app_version'] = APP_VERSION
     st.session_state.pop('results', None)
     st.session_state.pop('radar', None)
 
+
+def get_trade_state(code):
+    state = st.session_state.trade_states.get(code)
+    if not isinstance(state, TradeState):
+        state = TradeState()
+        st.session_state.trade_states[code] = state
+    state.shares = int(st.session_state.holdings.get(code, 0) or 0)
+    state.sellable = min(state.shares, int(st.session_state.sellable.get(code, state.shares) or 0))
+    state.avg_cost = float(st.session_state.costs.get(code, 0.0) or 0.0)
+    advance_day(state, china_now())
+    return state
+
+
+def evaluate_live_signal(code, sig, when, base_qty, cooldown_min=15, register=True):
+    state = get_trade_state(code)
+    previous = st.session_state.last_live_signal.get(code, '—')
+    remain = cooldown_remaining(state, sig.action_family, when, cooldown_min)
+    qty, block = plan_qty(state, sig.action_family, sig.qty, base_qty, lot=100)
+    actionable = sig.action_family in {'buy', 'add', 'sell', 'reentry', 'reduce', 'risk'}
+    if remain > 0:
+        qty = 0
+        block = f'同类信号冷却中，约剩{remain}分钟'
+    elif actionable and qty > 0 and register:
+        register_signal(state, sig.action_family, when)
+        st.session_state.last_live_signal[code] = f"{pd.Timestamp(when).strftime('%H:%M')} {sig.action}"
+    post_cd = cooldown_remaining(state, sig.action_family, when, cooldown_min) if actionable else 0
+    return {
+        'qty': int(qty), 'block': block, 'previous': previous,
+        'cooldown': int(post_cd), 'state': state,
+    }
+
+def confirm_plan_execution(code, sig, qty, price):
+    """只记录策略状态；真实持仓/可卖数量仍以左侧用户输入为准。"""
+    state = get_trade_state(code)
+    qty = max(0, int(qty // 100) * 100)
+    family = sig.action_family
+    if qty <= 0:
+        return '数量不足100股，未记录。'
+    if family == 'buy':
+        state.buy_used += qty
+        state.buy_count += 1
+    elif family == 'add':
+        state.add_count += 1
+    elif family in {'sell', 'reduce'}:
+        qty = min(qty, state.sellable)
+        if qty <= 0:
+            return 'T+1限制：当前可卖股数为0，未记录。'
+        state.sold_pool += qty
+        state.reentry_pending = True
+        state.last_sell_price = float(price)
+        state.reentry_low = float(sig.reentry_low)
+        state.reentry_high = float(sig.reentry_high)
+    elif family == 'reentry':
+        qty = min(qty, state.sold_pool)
+        state.sold_pool = max(0, state.sold_pool - qty)
+        if state.sold_pool < 100:
+            state.sold_pool = 0
+            state.reentry_pending = False
+    elif family == 'risk':
+        state.reentry_pending = False
+        state.sold_pool = 0
+    else:
+        return '当前不是需要记录成交的交易信号。'
+    state.ops_today += 1
+    state.last_trade_time = pd.Timestamp(china_now())
+    register_signal(state, family, china_now())
+    return f'已记录：{sig.action} {qty}股。请同步更新左侧真实持仓/可卖股数。'
+
 st.title(f'📈 A股主升浪雷达 V{APP_VERSION}')
-st.caption('策略引擎版｜买点/加仓/高抛/接回/减仓/风险退出六信号｜动态VWAP/ATR｜研究辅助，不构成投资建议')
+st.caption('状态机版｜15分钟防重复｜接回需前置高抛/减仓｜A股T+1可卖约束｜研究辅助，不构成投资建议')
 
 with st.sidebar:
     st.header('⚙️ 行情与运行模式')
@@ -150,6 +227,9 @@ with st.sidebar:
             st.session_state.watch = [x for x in st.session_state.watch if x != remove_code]
             st.session_state.holdings.pop(remove_code, None)
             st.session_state.costs.pop(remove_code, None)
+            st.session_state.sellable.pop(remove_code, None)
+            st.session_state.trade_states.pop(remove_code, None)
+            st.session_state.last_live_signal.pop(remove_code, None)
             try_save_watchlist(st.session_state.watch)
             st.rerun()
         st.caption('当前：' + '、'.join(st.session_state.watch))
@@ -171,23 +251,33 @@ with st.sidebar:
     refresh = st.slider('刷新秒数', 30, 300, 60, 10)
 
     st.divider()
-    st.subheader('🎯 V2.3 策略参数')
+    st.subheader('🎯 V2.3.1 策略参数')
     strategy_style = st.selectbox(
         '策略风格', ['稳健', '均衡', '进攻'], index=1,
         help='进攻模式降低买点/加仓阈值；稳健模式提高阈值。高抛和风险退出阈值不会因进攻模式而明显放宽。',
     )
     base_qty = st.number_input(
-        '单次基准交易股数', min_value=100, max_value=100000, value=100, step=100,
-        help='买点/加仓/接回的基础数量。高抛/减仓/风险退出则按当前持仓比例计算。',
+        '本轮基准交易股数', min_value=100, max_value=100000, value=200, step=100,
+        help='低吸一轮最多使用这个总额度，默认最多拆2次；加仓/接回也受状态机约束。',
     )
+    signal_cooldown = st.number_input('同类信号冷却（分钟）', min_value=5, max_value=60, value=15, step=5, help='风险退出固定使用更短的5分钟保护。')
 
     st.divider()
-    st.subheader('持仓')
-    st.caption('填入持仓和成本后，风险退出评分会额外参考浮盈亏；成本留0则忽略。')
+    st.subheader('持仓 / T+1可卖')
+    st.caption('“持仓股数”是总持仓；“今日可卖股数”用于A股T+1约束。当天新买入的股份不要计入可卖股数。')
     for c in codes:
         st.session_state.holdings[c] = st.number_input(
             f'{c} 持仓股数', min_value=0, step=100,
             value=int(st.session_state.holdings.get(c, 0)), key='hold_' + c,
+        )
+        sell_key = 'sellable_' + c
+        if sell_key not in st.session_state:
+            st.session_state[sell_key] = int(st.session_state.holdings[c])
+        if int(st.session_state[sell_key]) > int(st.session_state.holdings[c]):
+            st.session_state[sell_key] = int(st.session_state.holdings[c])
+        st.session_state.sellable[c] = st.number_input(
+            f'{c} 今日可卖股数', min_value=0, max_value=int(st.session_state.holdings[c]), step=100, key=sell_key,
+            help='券商账户里的“可用/可卖”数量。高抛、减仓、风险退出都不会超过这个数量。',
         )
         st.session_state.costs[c] = st.number_input(
             f'{c} 持仓成本', min_value=0.0, step=0.01, format='%.3f',
@@ -261,10 +351,19 @@ elif scan:
             s = analyze(
                 m, st.session_state.holdings.get(code, 0), market_score=regime['score'],
                 avg_cost=st.session_state.costs.get(code, 0.0), base_qty=base_qty, style=strategy_style,
+                sellable_holding=st.session_state.sellable.get(code, st.session_state.holdings.get(code, 0)),
+                state=get_trade_state(code).strategy_context(),
             )
             if s:
                 safe_live = live_mode and not fresh['stale']
+                when = pd.Timestamp(m['datetime'].max())
+                state_info = get_trade_state(code)
+                guard = {'qty': 0, 'block': '', 'previous': st.session_state.last_live_signal.get(code, '—'), 'cooldown': 0, 'state': state_info}
+                if safe_live:
+                    guard = evaluate_live_signal(code, s, when, base_qty, signal_cooldown, register=True)
                 action = s.action if safe_live else ('数据延迟·' + s.action if live_mode else '复盘·' + s.action)
+                if safe_live and guard['block']:
+                    action = '状态机保护·' + s.action
                 rows.append({
                     '代码': code,
                     '模式': '实时' if safe_live else ('延迟保护' if live_mode else '复盘'),
@@ -272,7 +371,11 @@ elif scan:
                     '新鲜度': fresh['label'],
                     '数据源': m.attrs.get('source', '未知'),
                     '缓存': '命中' if m.attrs.get('cache_hit') else '新取',
-                    '操作': action,
+                    '本次信号': action,
+                    '上次信号': guard['previous'],
+                    '冷却剩余': f"{guard['cooldown']}分钟" if guard['cooldown'] else '—',
+                    '今日已操作': int(guard['state'].ops_today),
+                    '状态': f"等待接回{guard['state'].sold_pool}股" if guard['state'].reentry_pending else '正常',
                     '信号强度': s.strength,
                     '趋势分': s.trend_score,
                     '动量分': s.momentum_score,
@@ -287,13 +390,15 @@ elif scan:
                     '乖离%': round(s.dev, 2),
                     'RSI': round(s.rsi, 1),
                     '量比': round(s.vol_ratio, 2),
-                    '建议股数': s.qty if safe_live else 0,
+                    '建议股数': guard['qty'] if safe_live else 0,
+                    '可卖股数': int(st.session_state.sellable.get(code, 0)),
                     '接回区间': f'{s.reentry_low:.2f}~{s.reentry_high:.2f}',
                     '失效价': round(s.invalid, 3),
                     '风险退出线': round(s.stop_price, 3),
                     '成本盈亏%': round(s.cost_pnl_pct, 2) if st.session_state.costs.get(code, 0.0) else '—',
-                    '原因': ('数据过旧，已锁定交易数量；' if fresh['stale'] else '') + '；'.join(s.reason),
+                    '原因': ('数据过旧，已锁定交易数量；' if fresh['stale'] else '') + (guard['block'] + '；' if guard['block'] else '') + '；'.join(s.reason),
                 })
+                st.session_state.last_analysis[code] = s
             else:
                 rows.append({'代码': code, '操作': '数据不足', '原因': f'{len(m)}根K线，策略至少需要30根'})
         except Exception as e:
@@ -365,11 +470,21 @@ else:
                 s = analyze(
                     df, st.session_state.holdings.get(pick, 0), market_score=regime['score'],
                     avg_cost=st.session_state.costs.get(pick, 0.0), base_qty=base_qty, style=strategy_style,
+                    sellable_holding=st.session_state.sellable.get(pick, st.session_state.holdings.get(pick, 0)),
+                    state=get_trade_state(pick).strategy_context(),
                 )
                 if s:
+                    st.session_state.last_analysis[pick] = s
+                if s:
                     safe_live = live_mode and not fresh['stale']
+                    guard = {'qty': 0, 'block': '', 'previous': st.session_state.last_live_signal.get(pick, '—'), 'cooldown': 0, 'state': get_trade_state(pick)}
+                    if safe_live:
+                        guard = evaluate_live_signal(pick, s, pd.Timestamp(df['datetime'].max()), base_qty, signal_cooldown, register=True)
+                    action_text = s.action if safe_live else (('数据延迟·' + s.action) if live_mode else ('复盘·' + s.action))
+                    if safe_live and guard['block']:
+                        action_text = '状态机保护·' + s.action
                     c1, c2, c3, c4, c5, c6 = st.columns(6)
-                    c1.metric('动作', s.action if safe_live else (('数据延迟·' + s.action) if live_mode else ('复盘·' + s.action)))
+                    c1.metric('动作', action_text)
                     c2.metric('信号强度', s.strength)
                     c3.metric('趋势', s.trend_score)
                     c4.metric('买点/加仓', f'{s.buy_score}/{s.add_score}')
@@ -384,9 +499,17 @@ else:
                         f"乖离 **{s.dev:.2f}%**｜量比 **{s.vol_ratio:.2f}**｜动量 **{s.momentum_score}/100**"
                     )
                     st.write(
-                        f"建议数量 **{s.qty if safe_live else 0}股**｜接回区间 **{s.reentry_low:.2f}～{s.reentry_high:.2f}**｜"
+                        f"建议数量 **{guard['qty'] if safe_live else 0}股**｜接回区间 **{s.reentry_low:.2f}～{s.reentry_high:.2f}**｜"
                         f"结构失效 **{s.invalid:.2f}**｜风险退出参考 **{s.stop_price:.2f}**｜突破参考 **{s.breakout_price:.2f}**"
                     )
+                    st.write(
+                        f"上次信号 **{guard['previous']}**｜冷却剩余 **{guard['cooldown']}分钟**｜"
+                        f"今日已确认操作 **{guard['state'].ops_today}次**｜"
+                        f"状态 **{'等待接回'+str(guard['state'].sold_pool)+'股' if guard['state'].reentry_pending else '正常'}**｜"
+                        f"今日可卖 **{st.session_state.sellable.get(pick, 0)}股**"
+                    )
+                    if guard['block'] and safe_live:
+                        st.warning('状态机保护：' + guard['block'])
                     if st.session_state.costs.get(pick, 0.0):
                         st.write(f"持仓成本 **{st.session_state.costs[pick]:.3f}**｜按现价计算浮盈亏 **{s.cost_pnl_pct:.2f}%**")
                     if fresh['stale'] and live_mode:
@@ -395,13 +518,13 @@ else:
                         st.warning('当前不是连续竞价时段：数量建议锁定为0，不发送实时交易提醒。')
                     st.info('；'.join(s.reason) if s.reason else '暂无强触发条件')
                     st.line_chart(df.tail(160).set_index('datetime')[['close']])
-                    if s.action_family != 'hold' and s.strength >= 65 and safe_live:
+                    if s.action_family != 'hold' and s.strength >= 65 and safe_live and guard['qty'] > 0:
                         msg = (
                             f'{pick} {s.action}<br>现价 {s.price:.2f}<br>信号强度 {s.strength}<br>'
                             f'趋势 {s.trend_score} / 动量 {s.momentum_score}<br>'
                             f'买点 {s.buy_score} / 加仓 {s.add_score} / 高抛 {s.sell_score} / 接回 {s.reentry_score}<br>'
                             f'减仓 {s.reduce_score} / 风险 {s.risk_score}<br>'
-                            f'建议 {s.qty}股<br>接回区间 {s.reentry_low:.2f}-{s.reentry_high:.2f}<br>'
+                            f'建议 {guard["qty"]}股<br>接回区间 {s.reentry_low:.2f}-{s.reentry_high:.2f}<br>'
                             f'结构失效 {s.invalid:.2f} / 风险退出参考 {s.stop_price:.2f}'
                         )
                         x, y = st.columns(2)
@@ -414,6 +537,26 @@ else:
             except Exception as e:
                 st.error(f'行情获取失败：{friendly_error(e)}')
 
+if codes:
+    st.markdown('#### 🧭 状态机手动登记')
+    st.caption('只有你实际成交后才登记。登记用于防重复、接回前置条件和今日操作次数；真实持仓/可卖数量仍请在左侧同步修改。')
+    exec_code = st.selectbox('登记股票', codes, key='exec_code')
+    last_sig = st.session_state.last_analysis.get(exec_code)
+    state = get_trade_state(exec_code)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric('上次信号', st.session_state.last_live_signal.get(exec_code, '—'))
+    m2.metric('今日已确认操作', state.ops_today)
+    m3.metric('待接回', f'{state.sold_pool}股' if state.reentry_pending else '无')
+    m4.metric('T+1可卖', f"{st.session_state.sellable.get(exec_code, 0)}股")
+    if last_sig and last_sig.action_family != 'hold':
+        exec_qty = st.number_input('实际成交股数', min_value=0, step=100, value=max(0, int(last_sig.qty // 100) * 100), key='exec_qty')
+        exec_price = st.number_input('实际成交价', min_value=0.0, step=0.01, value=float(last_sig.price), format='%.3f', key='exec_price')
+        if st.button(f'✅ 记录已执行：{last_sig.action}', use_container_width=False):
+            st.success(confirm_plan_execution(exec_code, last_sig, exec_qty, exec_price))
+            st.rerun()
+    else:
+        st.info('先执行一次“单股深度分析”或实时扫描，出现交易信号后再登记实际成交。')
+
 bt_tab, api_tab, help_tab = st.tabs(['📊 历史回测', '🔐 API配置', f'📘 V{APP_VERSION}说明'])
 with bt_tab:
     up = st.file_uploader('上传分钟CSV：datetime,open,high,low,close,volume', type=['csv'])
@@ -422,7 +565,7 @@ with bt_tab:
         df['datetime'] = pd.to_datetime(df['datetime'])
         sandbox_sig = analyze(df, holding=0, market_score=regime['score'], avg_cost=0.0, base_qty=base_qty, style=strategy_style)
         if sandbox_sig:
-            st.markdown('#### V2.3 策略沙盒：CSV最后一根K线')
+            st.markdown('#### V2.3.1 策略沙盒：CSV最后一根K线')
             q1, q2, q3, q4, q5, q6 = st.columns(6)
             q1.metric('动作', sandbox_sig.action)
             q2.metric('强度', sandbox_sig.strength)
@@ -431,15 +574,32 @@ with bt_tab:
             q5.metric('抛/接', f'{sandbox_sig.sell_score}/{sandbox_sig.reentry_score}')
             q6.metric('减/险', f'{sandbox_sig.reduce_score}/{sandbox_sig.risk_score}')
             st.caption('；'.join(sandbox_sig.reason) if sandbox_sig.reason else '暂无强触发条件')
-        init = st.number_input('初始资金', 10000, 10000000, 100000, 10000)
-        bt = backtest(df, initial_cash=init, style=strategy_style, base_qty=base_qty)
+        init = st.number_input('初始现金', 10000, 10000000, 100000, 10000)
+        b1, b2 = st.columns(2)
+        initial_holding = b1.number_input('回测开始前已有底仓股数', min_value=0, max_value=1000000, value=0, step=100, help='已有底仓视为隔夜仓，当天可卖。测试高抛/接回时可填1000股。')
+        initial_cost = b2.number_input('底仓成本', min_value=0.0, value=0.0, step=0.01, format='%.3f', help='填0时回测自动用第一根K线价格作为参考成本。')
+        bt = backtest(
+            df, initial_cash=init, style=strategy_style, base_qty=base_qty,
+            initial_holding=initial_holding, initial_cost=initial_cost,
+            cooldown_minutes=signal_cooldown,
+        )
         aa, bb, cc, dd = st.columns(4)
         aa.metric('收益率', f"{bt['return_pct']:.2f}%")
         bb.metric('最大回撤', f"{bt['max_drawdown_pct']:.2f}%")
-        cc.metric('高抛胜率', f"{bt['win_rate']:.1f}%")
+        cc.metric('卖出胜率', f"{bt['win_rate']:.1f}%")
         dd.metric('期末权益', f"{bt['final_equity']:.0f}")
+        final_state = bt['state']
+        st.caption(
+            f"状态机结果：持仓 {final_state.shares}股｜可卖 {final_state.sellable}股｜"
+            f"待接回 {final_state.sold_pool}股｜今日已操作 {final_state.ops_today}次｜"
+            f"低吸已用 {final_state.buy_used}/{int(base_qty)}股｜加仓次数 {final_state.add_count}"
+        )
         if not bt['trades'].empty:
+            st.markdown('##### 实际执行交易（已通过状态机）')
             st.dataframe(bt['trades'], use_container_width=True, hide_index=True)
+        if not bt['events'].empty:
+            with st.expander('查看状态机拦截/冷却明细', expanded=False):
+                st.dataframe(bt['events'].tail(200), use_container_width=True, hide_index=True)
 
 with api_tab:
     st.markdown('''### Streamlit Secrets 建议配置
@@ -456,10 +616,16 @@ PUSHPLUS_TOKEN = ""
 SERVERCHAN_KEY = ""
 ```
 
-V2.3.0 左侧可以临时一键切换 trial / paid。若希望重启后仍默认 paid，再把 Secrets 中的 `ALLTICK_ACCESS_MODE` 改成 `paid`。''')
+V2.3.1 左侧可以临时一键切换 trial / paid。若希望重启后仍默认 paid，再把 Secrets 中的 `ALLTICK_ACCESS_MODE` 改成 `paid`。''')
 
 with help_tab:
-    st.markdown('''### V2.3.0 策略引擎
+    st.markdown('''### V2.3.1 状态机策略引擎
+- **15分钟同类信号冷却**：首次触发后进入冷却，风险退出使用更短的5分钟保护，避免一分钟一条重复提醒。
+- **低吸最多两批**：本轮低吸总量不超过“本轮基准交易股数”；例如200股默认最多100+100，不再无限BUY。
+- **接回有前置条件**：只有你已确认执行过高抛/减仓并形成“待接回仓位”，接回评分才会启用。
+- **加仓次数上限**：同一轮加仓最多1次，并且必须已有底仓；无底仓不会把突破信号误叫“加仓”。
+- **A股T+1**：新增“今日可卖股数”，高抛/减仓/风险退出均不会超过可卖数量；回测跨日后才解锁当天买入股份。
+- **手动成交确认**：实盘信号出现后，可在“状态机手动登记”里记录已执行成交，驱动待接回、操作次数等状态。
 - **六类信号并行评分**：买点、加仓、高抛、接回、减仓、风险退出，各自0～100分。
 - **趋势 + 动量双评分**：MA结构、MA20斜率、MACD柱、短周期收益、VWAP位置共同决定。
 - **动态接回区间**：根据当日VWAP和ATR波动自动生成，不再只给一个固定接回价。
@@ -467,15 +633,15 @@ with help_tab:
 - **突破加仓识别**：20K前高 + 量能确认 + 主升趋势，用于识别分歧转一致后的加速。
 - **持仓成本辅助**：成本可选；只有“浮亏 + 趋势破坏”同时出现时才额外提高风险分，不会仅因浮亏机械止损。
 - **三种策略风格**：稳健 / 均衡 / 进攻。风格主要改变买点、加仓、接回阈值，不弱化风险保护。
-- **数量模型**：买/加/接回按“单次基准股数”；高抛/减仓/风险退出按当前持仓比例并按100股取整。
+- **数量模型**：低吸按“本轮基准股数”拆批；加仓/接回受状态机次数与待接回仓位限制；卖出类同时受T+1可卖数量限制。
 - **通知升级**：六类非观察信号达到强度阈值后都可发送 PushPlus / Server酱。
-- **策略沙盒**：即使 AllTick Trial 不能访问自选A股，也可以上传分钟CSV验证V2.3信号。
+- **策略沙盒**：即使 AllTick Trial 不能访问自选A股，也可以上传分钟CSV验证V2.3.1状态机与六信号。
 
 ### 仍然保留 V2.2.3 的保护
 北京时间、API缓存、429退避、604权限状态、Trial安全模式、网页管理自选股和分钟K数据新鲜度保护全部保留。
 
 ### 风险说明
-V2.3.0 是规则化研究辅助系统，不会自动下单。分钟级技术信号不能替代基本面、公告、涨跌停、流动性和重大事件判断。''')
+V2.3.1 是规则化研究辅助系统，不会自动下单。分钟级技术信号不能替代基本面、公告、涨跌停、流动性和重大事件判断。''')
 
 if auto and (summary['alltick_configured'] or summary['tushare_configured']):
     time.sleep(refresh)

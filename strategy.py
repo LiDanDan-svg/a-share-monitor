@@ -71,6 +71,8 @@ def analyze(
     avg_cost=0.0,
     base_qty=100,
     style='均衡',
+    state=None,
+    sellable_holding=None,
 ):
     """V2.3 多信号策略引擎。
 
@@ -110,6 +112,8 @@ def analyze(
     intraday_pct = _finite(r.intraday_pct, 0)
 
     market_score = _clamp(market_score)
+    state = state or {}
+    reentry_allowed = bool(state.get('reentry_pending')) and int(state.get('sold_pool', 0) or 0) >= max(1, int(lot or 100))
     style = str(style or '均衡')
     if style not in {'稳健', '均衡', '进攻'}:
         style = '均衡'
@@ -228,22 +232,35 @@ def analyze(
 
     # ---------- 接回：高抛后回归VWAP附近，趋势仍在 ----------
     reentry = 0
-    if trend_score >= 50:
-        reentry += 25; reasons['reentry'].append('趋势仍保持')
-    if -0.9 <= dev <= 0.35:
-        reentry += 28; reasons['reentry'].append('回到VWAP接回区')
-    elif -1.5 <= dev <= 0.8:
-        reentry += 16
-    if 43 <= rsi <= 62:
-        reentry += 18; reasons['reentry'].append('RSI已降温')
-    if vol <= 1.25:
-        reentry += 10; reasons['reentry'].append('回踩量能未失控')
-    if ret3 >= -0.8 and macd_hist >= prev_macd_hist:
-        reentry += 10; reasons['reentry'].append('回踩后动能企稳')
-    if drawdown20 < -5.5:
-        reentry -= 15
-    if market_score < 35:
-        reentry -= 15
+    if reentry_allowed:
+        if trend_score >= 50:
+            reentry += 25; reasons['reentry'].append('趋势仍保持')
+        if -0.9 <= dev <= 0.35:
+            reentry += 28; reasons['reentry'].append('回到VWAP接回区')
+        elif -1.5 <= dev <= 0.8:
+            reentry += 16
+        if 43 <= rsi <= 62:
+            reentry += 18; reasons['reentry'].append('RSI已降温')
+        if vol <= 1.25:
+            reentry += 10; reasons['reentry'].append('回踩量能未失控')
+        if ret3 >= -0.8 and macd_hist >= prev_macd_hist:
+            reentry += 10; reasons['reentry'].append('回踩后动能企稳')
+        if drawdown20 < -5.5:
+            reentry -= 15
+        if market_score < 35:
+            reentry -= 15
+        last_sell_price = _finite(state.get('last_sell_price', 0), 0)
+        if last_sell_price > 0 and p >= last_sell_price:
+            reentry -= 28; reasons['reentry'].append('尚未低于上次高抛/减仓成交价')
+        plan_low = _finite(state.get('reentry_low', 0), 0)
+        plan_high = _finite(state.get('reentry_high', 0), 0)
+        if plan_low > 0 and plan_high > 0:
+            if plan_low * 0.995 <= p <= plan_high * 1.005:
+                reentry += 12; reasons['reentry'].append('进入已记录的目标接回区间')
+            elif p > plan_high * 1.02:
+                reentry -= 12
+    else:
+        reasons['reentry'].append('无已执行高抛/减仓记录，不生成接回信号')
 
     # ---------- 减仓：结构走弱，但尚未达到硬性退出 ----------
     reduce = 0
@@ -303,6 +320,9 @@ def analyze(
 
     holding = max(0, int(holding or 0))
     lot = max(1, int(lot or 100))
+    if sellable_holding is None:
+        sellable_holding = holding
+    sellable_holding = max(0, min(holding, int(sellable_holding or 0)))
     base_qty = max(lot, _round_lot(max(lot, int(base_qty or lot)), lot))
 
     # 支撑/失效/接回区间：根据VWAP + ATR动态生成。
@@ -316,7 +336,8 @@ def analyze(
     stop_price = min(ma20 if ma20 > 0 else p, vwap) * (1 - max(0.008, min(0.025, (atr_pct / 100) * 1.4)))
     breakout_price = prev_high20 if prev_high20 > 0 else p
 
-    # 动作优先级：风险退出 > 减仓 > 高抛 > 加仓 > 买点 > 接回 > 持有/观察
+    # 动作优先级：风险退出 > 减仓 > 高抛 > 加仓 > 接回 > 买点 > 持有/观察。
+    # 接回只在状态机确认之前确实执行过高抛/减仓后才有资格出现。
     action_family = 'hold'
     action = '持有/观察'
     qty = 0
@@ -327,38 +348,38 @@ def analyze(
         if holding > 0:
             action = '风险退出候选'
             pct = 1.0 if risk >= 88 else 0.5
-            qty = _sell_qty(holding, pct, lot)
+            qty = _sell_qty(sellable_holding, pct, lot)
         else:
             action = '风险回避'
         selected_reasons = reasons['risk']
     elif reduce >= reduce_th and holding > 0:
         action_family = 'reduce'
         action = '减仓候选'
-        qty = _sell_qty(holding, 0.33 if reduce < 82 else 0.5, lot)
+        qty = _sell_qty(sellable_holding, 0.33 if reduce < 82 else 0.5, lot)
         selected_reasons = reasons['reduce']
     elif sell >= sell_th:
         action_family = 'sell'
         if holding > 0:
             action = '强高抛候选' if sell >= 82 else '高抛候选'
-            qty = _sell_qty(holding, 0.50 if sell >= 88 else 0.33, lot)
+            qty = _sell_qty(sellable_holding, 0.50 if sell >= 88 else 0.33, lot)
         else:
             action = '过热·不追'
         selected_reasons = reasons['sell']
-    elif add >= add_th:
+    elif add >= add_th and holding > 0:
         action_family = 'add'
-        action = '主升加仓候选' if holding > 0 else '突破买点候选'
+        action = '主升加仓候选'
         qty = base_qty * (2 if add >= 88 and style == '进攻' else 1)
         selected_reasons = reasons['add']
+    elif reentry >= reentry_th and reentry_allowed:
+        action_family = 'reentry'
+        action = '接回候选'
+        qty = min(base_qty, int(state.get('sold_pool', base_qty) or base_qty))
+        selected_reasons = reasons['reentry']
     elif buy >= buy_th:
         action_family = 'buy'
         action = '低吸买点候选'
         qty = base_qty
         selected_reasons = reasons['buy']
-    elif reentry >= reentry_th and holding > 0:
-        action_family = 'reentry'
-        action = '接回候选'
-        qty = base_qty
-        selected_reasons = reasons['reentry']
     elif trend_score >= 60 and market_score >= 45:
         action_family = 'hold'
         action = '主升持有'
