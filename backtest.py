@@ -1,30 +1,103 @@
 import pandas as pd
-from indicators import add_indicators
 
-def backtest(df, initial_cash=100000, lot=100, fee=0.0003, stamp=0.0005, slippage=0.0002, market_score=60):
-    x=add_indicators(df).dropna().reset_index(drop=True)
-    cash=initial_cash; shares=0; avg=0; sold_lots=0; trades=[]; eq=[]; peak=initial_cash; maxdd=0
-    for i,r in x.iterrows():
-        p=float(r.close); v=float(r.vwap)
-        buy=(r.trend==1 and p>=v and 45<=r.rsi<70 and r.vol_ratio>=0.8 and market_score>=40)
-        sell=((r.rsi>=78 and r.vwap_dev>=1.8) or (r.rsi>=75 and i>0 and p<x.iloc[i-1].close))
-        if shares==0 and buy:
-            qty=int(cash/(p*(1+fee+slippage))//lot)*lot
-            if qty>=lot:
-                cash-=qty*p*(1+fee+slippage); shares=qty; avg=p
-                trades.append({'datetime':r.datetime,'side':'BUY','price':p,'qty':qty,'pnl':0})
-        elif shares>0 and sell:
-            qty=max(lot,(shares//3//lot)*lot); qty=min(qty,shares)
-            proceeds=qty*p*(1-fee-stamp-slippage); cash+=proceeds; shares-=qty
-            pnl=qty*(p-avg)-qty*p*(fee+stamp+slippage)-qty*avg*fee
-            trades.append({'datetime':r.datetime,'side':'SELL','price':p,'qty':qty,'pnl':pnl})
-            sold_lots+=qty
-        elif sold_lots>=lot and shares>=0 and p<=v*1.001 and r.rsi<65:
-            qty=min(sold_lots,int(cash/(p*(1+fee+slippage))//lot)*lot)
-            if qty>=lot:
-                cash-=qty*p*(1+fee+slippage); shares+=qty; sold_lots-=qty
-                trades.append({'datetime':r.datetime,'side':'REENTRY','price':p,'qty':qty,'pnl':0})
-        equity=cash+shares*p; eq.append(equity); peak=max(peak,equity); maxdd=min(maxdd,(equity/peak-1)*100)
-    final=eq[-1] if eq else initial_cash
-    sells=[t for t in trades if t['side']=='SELL']; wins=[t for t in sells if t['pnl']>0]
-    return {'return_pct':(final/initial_cash-1)*100,'max_drawdown_pct':maxdd,'win_rate':len(wins)/len(sells)*100 if sells else 0,'final_equity':final,'trades':pd.DataFrame(trades)}
+from strategy import analyze
+
+
+def backtest(
+    df,
+    initial_cash=100000,
+    lot=100,
+    fee=0.0003,
+    stamp=0.0005,
+    slippage=0.0002,
+    market_score=60,
+    style='均衡',
+    base_qty=100,
+):
+    """用 V2.3 信号引擎做简化回测。
+
+    回测只验证策略行为，不等同于真实成交；未模拟涨跌停、盘口冲击和成交排队。
+    """
+    x = df.copy().sort_values('datetime').reset_index(drop=True)
+    cash = float(initial_cash)
+    shares = 0
+    avg_cost = 0.0
+    trades = []
+    sold_pool = 0
+    last_trade_i = -99
+    equity_curve = []
+    peak = float(initial_cash)
+    maxdd = 0.0
+
+    for i in range(29, len(x)):
+        seg = x.iloc[: i + 1].copy()
+        p = float(seg.iloc[-1]['close'])
+        sig = analyze(
+            seg,
+            holding=shares,
+            lot=lot,
+            market_score=market_score,
+            avg_cost=avg_cost,
+            base_qty=base_qty,
+            style=style,
+        )
+        if sig is None:
+            continue
+
+        if sig.action_family in {'buy', 'add', 'reentry'} and i - last_trade_i >= 3:
+            qty = max(lot, int(sig.qty // lot) * lot)
+            if sig.action_family == 'reentry':
+                qty = min(qty, sold_pool)
+            equity_before = cash + shares * p
+            max_position_value = equity_before * 0.70
+            room_qty = max(0, int((max_position_value - shares * p) / p // lot) * lot)
+            affordable = int(cash / (p * (1 + fee + slippage)) // lot) * lot
+            qty = min(qty, affordable, room_qty)
+            if qty >= lot:
+                cost = qty * p * (1 + fee + slippage)
+                old_value = shares * avg_cost
+                cash -= cost
+                shares += qty
+                avg_cost = (old_value + qty * p) / shares if shares else 0.0
+                if sig.action_family == 'reentry':
+                    sold_pool = max(0, sold_pool - qty)
+                last_trade_i = i
+                trades.append({
+                    'datetime': seg.iloc[-1]['datetime'], 'side': sig.action_family.upper(),
+                    'price': p, 'qty': qty, 'score': sig.score, 'action': sig.action, 'pnl': 0.0,
+                })
+
+        elif sig.action_family in {'sell', 'reduce', 'risk'} and shares >= lot and i - last_trade_i >= 3:
+            qty = min(shares, max(lot, int(sig.qty // lot) * lot))
+            proceeds = qty * p * (1 - fee - stamp - slippage)
+            pnl = qty * (p - avg_cost) - qty * p * (fee + stamp + slippage) - qty * avg_cost * fee
+            cash += proceeds
+            shares -= qty
+            if sig.action_family == 'sell':
+                sold_pool += qty
+            elif sig.action_family == 'risk':
+                sold_pool = 0
+            last_trade_i = i
+            trades.append({
+                'datetime': seg.iloc[-1]['datetime'], 'side': sig.action_family.upper(),
+                'price': p, 'qty': qty, 'score': sig.score, 'action': sig.action, 'pnl': pnl,
+            })
+            if shares == 0:
+                avg_cost = 0.0
+
+        equity = cash + shares * p
+        equity_curve.append(equity)
+        peak = max(peak, equity)
+        maxdd = min(maxdd, (equity / peak - 1) * 100)
+
+    final_price = float(x.iloc[-1]['close']) if len(x) else 0.0
+    final = cash + shares * final_price
+    exits = [t for t in trades if t['side'] in {'SELL', 'REDUCE', 'RISK'}]
+    wins = [t for t in exits if t['pnl'] > 0]
+    return {
+        'return_pct': (final / initial_cash - 1) * 100 if initial_cash else 0,
+        'max_drawdown_pct': maxdd,
+        'win_rate': len(wins) / len(exits) * 100 if exits else 0,
+        'final_equity': final,
+        'trades': pd.DataFrame(trades),
+    }

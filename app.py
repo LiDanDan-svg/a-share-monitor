@@ -23,7 +23,7 @@ from data import (
 )
 from strategy import analyze
 
-APP_VERSION = '2.2.3'
+APP_VERSION = '2.3.0'
 WATCHLIST_FILE = Path(__file__).with_name('watchlist.json')
 
 st.set_page_config(
@@ -81,13 +81,15 @@ if 'watch' not in st.session_state:
     st.session_state.watch = load_initial_watchlist()
 if 'holdings' not in st.session_state:
     st.session_state.holdings = {}
+if 'costs' not in st.session_state:
+    st.session_state.costs = {}
 if st.session_state.get('_app_version') != APP_VERSION:
     st.session_state['_app_version'] = APP_VERSION
     st.session_state.pop('results', None)
     st.session_state.pop('radar', None)
 
 st.title(f'📈 A股主升浪雷达 V{APP_VERSION}')
-st.caption('准生产版｜北京时间｜API缓存/退避｜网页管理自选股｜数据新鲜度保护｜研究辅助，不构成投资建议')
+st.caption('策略引擎版｜买点/加仓/高抛/接回/减仓/风险退出六信号｜动态VWAP/ATR｜研究辅助，不构成投资建议')
 
 with st.sidebar:
     st.header('⚙️ 行情与运行模式')
@@ -147,6 +149,7 @@ with st.sidebar:
         if st.button('➖ 删除所选', use_container_width=True):
             st.session_state.watch = [x for x in st.session_state.watch if x != remove_code]
             st.session_state.holdings.pop(remove_code, None)
+            st.session_state.costs.pop(remove_code, None)
             try_save_watchlist(st.session_state.watch)
             st.rerun()
         st.caption('当前：' + '、'.join(st.session_state.watch))
@@ -168,11 +171,27 @@ with st.sidebar:
     refresh = st.slider('刷新秒数', 30, 300, 60, 10)
 
     st.divider()
+    st.subheader('🎯 V2.3 策略参数')
+    strategy_style = st.selectbox(
+        '策略风格', ['稳健', '均衡', '进攻'], index=1,
+        help='进攻模式降低买点/加仓阈值；稳健模式提高阈值。高抛和风险退出阈值不会因进攻模式而明显放宽。',
+    )
+    base_qty = st.number_input(
+        '单次基准交易股数', min_value=100, max_value=100000, value=100, step=100,
+        help='买点/加仓/接回的基础数量。高抛/减仓/风险退出则按当前持仓比例计算。',
+    )
+
+    st.divider()
     st.subheader('持仓')
+    st.caption('填入持仓和成本后，风险退出评分会额外参考浮盈亏；成本留0则忽略。')
     for c in codes:
         st.session_state.holdings[c] = st.number_input(
-            c, min_value=0, step=100,
+            f'{c} 持仓股数', min_value=0, step=100,
             value=int(st.session_state.holdings.get(c, 0)), key='hold_' + c,
+        )
+        st.session_state.costs[c] = st.number_input(
+            f'{c} 持仓成本', min_value=0.0, step=0.01, format='%.3f',
+            value=float(st.session_state.costs.get(c, 0.0)), key='cost_' + c,
         )
 
     st.divider()
@@ -239,7 +258,10 @@ elif scan:
         try:
             m = fetch_minute(code, period)
             fresh = data_freshness(m, period, live=live_mode)
-            s = analyze(m, st.session_state.holdings.get(code, 0), market_score=regime['score'])
+            s = analyze(
+                m, st.session_state.holdings.get(code, 0), market_score=regime['score'],
+                avg_cost=st.session_state.costs.get(code, 0.0), base_qty=base_qty, style=strategy_style,
+            )
             if s:
                 safe_live = live_mode and not fresh['stale']
                 action = s.action if safe_live else ('数据延迟·' + s.action if live_mode else '复盘·' + s.action)
@@ -251,22 +273,29 @@ elif scan:
                     '数据源': m.attrs.get('source', '未知'),
                     '缓存': '命中' if m.attrs.get('cache_hit') else '新取',
                     '操作': action,
-                    '综合高抛': s.sell_score,
+                    '信号强度': s.strength,
+                    '趋势分': s.trend_score,
+                    '动量分': s.momentum_score,
                     '买点': s.buy_score,
                     '加仓': s.add_score,
+                    '高抛': s.sell_score,
                     '接回': s.reentry_score,
-                    '现价': s.price,
-                    'VWAP': s.vwap,
-                    '乖离%': s.dev,
-                    'RSI': s.rsi,
-                    '量比': s.vol_ratio,
+                    '减仓': s.reduce_score,
+                    '风险': s.risk_score,
+                    '现价': round(s.price, 3),
+                    'VWAP': round(s.vwap, 3),
+                    '乖离%': round(s.dev, 2),
+                    'RSI': round(s.rsi, 1),
+                    '量比': round(s.vol_ratio, 2),
                     '建议股数': s.qty if safe_live else 0,
-                    '目标接回': s.reentry,
-                    '失效价': s.invalid,
+                    '接回区间': f'{s.reentry_low:.2f}~{s.reentry_high:.2f}',
+                    '失效价': round(s.invalid, 3),
+                    '风险退出线': round(s.stop_price, 3),
+                    '成本盈亏%': round(s.cost_pnl_pct, 2) if st.session_state.costs.get(code, 0.0) else '—',
                     '原因': ('数据过旧，已锁定交易数量；' if fresh['stale'] else '') + '；'.join(s.reason),
                 })
             else:
-                rows.append({'代码': code, '操作': '数据不足', '原因': f'{len(m)}根K线，策略至少需要25根'})
+                rows.append({'代码': code, '操作': '数据不足', '原因': f'{len(m)}根K线，策略至少需要30根'})
         except Exception as e:
             rows.append({'代码': code, '操作': '数据失败', '原因': friendly_error(e)})
         prog.progress((i + 1) / max(1, len(codes)))
@@ -299,14 +328,16 @@ with st.expander('稳定全市场扫描', expanded=True):
                 try:
                     m = fetch_minute(code, period)
                     fresh = data_freshness(m, period, live=live_mode)
-                    s = analyze(m, 0, market_score=regime['score'])
+                    s = analyze(m, 0, market_score=regime['score'], avg_cost=0.0, base_qty=base_qty, style=strategy_style)
                     if s:
                         rr.append({
                             '代码': code, '名称': row.get('name', ''), '数据源': m.attrs.get('source', '未知'),
                             '新鲜度': fresh['label'], '涨跌%': row.get('pct', 0), '成交额': row.get('amount', 0),
+                            '信号强度': s.strength, '趋势分': s.trend_score, '动量分': s.momentum_score,
                             '买点': s.buy_score, '加仓': s.add_score, '高抛': s.sell_score, '接回': s.reentry_score,
+                            '减仓': s.reduce_score, '风险': s.risk_score,
                             '动作': ('数据延迟·' if fresh['stale'] and live_mode else '') + s.action,
-                            'RSI': s.rsi, 'VWAP乖离%': s.dev,
+                            'RSI': round(s.rsi, 1), 'VWAP乖离%': round(s.dev, 2), '量比': round(s.vol_ratio, 2),
                         })
                 except Exception as e:
                     rr.append({'代码': code, '名称': row.get('name', ''), '动作': '分钟失败', '原因': friendly_error(e)})
@@ -314,7 +345,7 @@ with st.expander('稳定全市场扫描', expanded=True):
             st.session_state.radar = pd.DataFrame(rr)
     radar = st.session_state.get('radar', pd.DataFrame())
     if not radar.empty:
-        sort_cols = [c for c in ['买点', '加仓'] if c in radar.columns]
+        sort_cols = [c for c in ['信号强度', '买点', '加仓'] if c in radar.columns]
         if sort_cols:
             radar = radar.sort_values(sort_cols, ascending=False)
         st.dataframe(radar, use_container_width=True, hide_index=True)
@@ -331,34 +362,47 @@ else:
             try:
                 df = fetch_minute(pick, period)
                 fresh = data_freshness(df, period, live=live_mode)
-                s = analyze(df, st.session_state.holdings.get(pick, 0), market_score=regime['score'])
+                s = analyze(
+                    df, st.session_state.holdings.get(pick, 0), market_score=regime['score'],
+                    avg_cost=st.session_state.costs.get(pick, 0.0), base_qty=base_qty, style=strategy_style,
+                )
                 if s:
                     safe_live = live_mode and not fresh['stale']
-                    c1, c2, c3, c4, c5 = st.columns(5)
-                    c1.metric('动作', s.action if safe_live else ('延迟保护' if live_mode else '复盘'))
-                    c2.metric('高抛', s.sell_score)
-                    c3.metric('买点', s.buy_score)
-                    c4.metric('加仓', s.add_score)
-                    c5.metric('接回', s.reentry_score)
+                    c1, c2, c3, c4, c5, c6 = st.columns(6)
+                    c1.metric('动作', s.action if safe_live else (('数据延迟·' + s.action) if live_mode else ('复盘·' + s.action)))
+                    c2.metric('信号强度', s.strength)
+                    c3.metric('趋势', s.trend_score)
+                    c4.metric('买点/加仓', f'{s.buy_score}/{s.add_score}')
+                    c5.metric('高抛/接回', f'{s.sell_score}/{s.reentry_score}')
+                    c6.metric('减仓/风险', f'{s.reduce_score}/{s.risk_score}')
                     st.caption(
                         f"分钟行情源：{df.attrs.get('source', '未知')}｜最新K线：{df['datetime'].max()}｜"
-                        f"新鲜度：{fresh['label']}｜{'缓存命中' if df.attrs.get('cache_hit') else '新请求'}"
+                        f"新鲜度：{fresh['label']}｜{'缓存命中' if df.attrs.get('cache_hit') else '新请求'}｜策略风格：{s.style}"
                     )
                     st.write(
                         f"当前价 **{s.price:.2f}**｜当日VWAP **{s.vwap:.2f}**｜RSI **{s.rsi:.1f}**｜"
-                        f"乖离 **{s.dev:.2f}%**｜量比 **{s.vol_ratio:.2f}**"
+                        f"乖离 **{s.dev:.2f}%**｜量比 **{s.vol_ratio:.2f}**｜动量 **{s.momentum_score}/100**"
                     )
-                    st.write(f"建议高抛 **{s.qty if safe_live else 0}股**｜目标接回 **{s.reentry:.2f}**｜失效价 **{s.invalid:.2f}**")
+                    st.write(
+                        f"建议数量 **{s.qty if safe_live else 0}股**｜接回区间 **{s.reentry_low:.2f}～{s.reentry_high:.2f}**｜"
+                        f"结构失效 **{s.invalid:.2f}**｜风险退出参考 **{s.stop_price:.2f}**｜突破参考 **{s.breakout_price:.2f}**"
+                    )
+                    if st.session_state.costs.get(pick, 0.0):
+                        st.write(f"持仓成本 **{st.session_state.costs[pick]:.3f}**｜按现价计算浮盈亏 **{s.cost_pnl_pct:.2f}%**")
                     if fresh['stale'] and live_mode:
                         st.error('数据新鲜度保护已触发：最新分钟K过旧，实时交易数量强制锁定为0。')
                     elif not live_mode:
-                        st.warning('当前不是连续竞价时段：数量建议锁定为0，不发送实时高抛提醒。')
+                        st.warning('当前不是连续竞价时段：数量建议锁定为0，不发送实时交易提醒。')
                     st.info('；'.join(s.reason) if s.reason else '暂无强触发条件')
                     st.line_chart(df.tail(160).set_index('datetime')[['close']])
-                    if s.sell_score >= 60 and safe_live:
+                    if s.action_family != 'hold' and s.strength >= 65 and safe_live:
                         msg = (
-                            f'{pick} {s.action}<br>现价 {s.price:.2f}<br>高抛 {s.sell_score}<br>'
-                            f'RSI {s.rsi:.1f}<br>建议 {s.qty}股<br>接回 {s.reentry:.2f}<br>失效 {s.invalid:.2f}'
+                            f'{pick} {s.action}<br>现价 {s.price:.2f}<br>信号强度 {s.strength}<br>'
+                            f'趋势 {s.trend_score} / 动量 {s.momentum_score}<br>'
+                            f'买点 {s.buy_score} / 加仓 {s.add_score} / 高抛 {s.sell_score} / 接回 {s.reentry_score}<br>'
+                            f'减仓 {s.reduce_score} / 风险 {s.risk_score}<br>'
+                            f'建议 {s.qty}股<br>接回区间 {s.reentry_low:.2f}-{s.reentry_high:.2f}<br>'
+                            f'结构失效 {s.invalid:.2f} / 风险退出参考 {s.stop_price:.2f}'
                         )
                         x, y = st.columns(2)
                         if x.button('📲 PushPlus', key='push_' + pick):
@@ -366,7 +410,7 @@ else:
                         if y.button('📲 Server酱', key='sc_' + pick):
                             st.write(send_serverchan(sc, 'A股高抛低吸信号', msg))
                 else:
-                    st.warning(f'当前只有 {len(df)} 根K线，至少需要25根。')
+                    st.warning(f'当前只有 {len(df)} 根K线，至少需要30根。')
             except Exception as e:
                 st.error(f'行情获取失败：{friendly_error(e)}')
 
@@ -376,8 +420,19 @@ with bt_tab:
     if up:
         df = pd.read_csv(up)
         df['datetime'] = pd.to_datetime(df['datetime'])
+        sandbox_sig = analyze(df, holding=0, market_score=regime['score'], avg_cost=0.0, base_qty=base_qty, style=strategy_style)
+        if sandbox_sig:
+            st.markdown('#### V2.3 策略沙盒：CSV最后一根K线')
+            q1, q2, q3, q4, q5, q6 = st.columns(6)
+            q1.metric('动作', sandbox_sig.action)
+            q2.metric('强度', sandbox_sig.strength)
+            q3.metric('趋势', sandbox_sig.trend_score)
+            q4.metric('买/加', f'{sandbox_sig.buy_score}/{sandbox_sig.add_score}')
+            q5.metric('抛/接', f'{sandbox_sig.sell_score}/{sandbox_sig.reentry_score}')
+            q6.metric('减/险', f'{sandbox_sig.reduce_score}/{sandbox_sig.risk_score}')
+            st.caption('；'.join(sandbox_sig.reason) if sandbox_sig.reason else '暂无强触发条件')
         init = st.number_input('初始资金', 10000, 10000000, 100000, 10000)
-        bt = backtest(df, initial_cash=init)
+        bt = backtest(df, initial_cash=init, style=strategy_style, base_qty=base_qty)
         aa, bb, cc, dd = st.columns(4)
         aa.metric('收益率', f"{bt['return_pct']:.2f}%")
         bb.metric('最大回撤', f"{bt['max_drawdown_pct']:.2f}%")
@@ -401,21 +456,26 @@ PUSHPLUS_TOKEN = ""
 SERVERCHAN_KEY = ""
 ```
 
-V2.2.3 左侧可以临时一键切换 trial / paid。若希望重启后仍默认 paid，再把 Secrets 中的 `ALLTICK_ACCESS_MODE` 改成 `paid`。''')
+V2.3.0 左侧可以临时一键切换 trial / paid。若希望重启后仍默认 paid，再把 Secrets 中的 `ALLTICK_ACCESS_MODE` 改成 `paid`。''')
 
 with help_tab:
-    st.markdown('''### V2.2.3 新增
-- **北京时间统一**：页面扫描时间、API最近成功时间全部显示北京时间。
-- **Trial / Paid 会话切换**：左侧可直接切换；切换不会自动购买权限。
-- **分钟K短时缓存**：交易时段默认20秒，非交易时段5分钟，减少重复调用。
-- **429指数退避**：触发限流后自动进入30/60/120/240秒冷却，不再持续硬请求。
-- **604权限状态**：无权限股票会进入API健康状态记录。
-- **自选股脱离代码**：初始列表来自 `watchlist.json` 或 Secrets 的 `WATCHLIST`，网页可直接添加/删除。
-- **数据新鲜度保护**：交易时段分钟K过旧时，实时建议数量强制归零，防止旧行情误触发。
-- **API健康面板**：显示正常/限流/无权限/Token异常、最近成功时间和无权限代码。
+    st.markdown('''### V2.3.0 策略引擎
+- **六类信号并行评分**：买点、加仓、高抛、接回、减仓、风险退出，各自0～100分。
+- **趋势 + 动量双评分**：MA结构、MA20斜率、MACD柱、短周期收益、VWAP位置共同决定。
+- **动态接回区间**：根据当日VWAP和ATR波动自动生成，不再只给一个固定接回价。
+- **高抛与风险退出分离**：趋势仍强但过热叫“高抛”；趋势破坏则转为“减仓/风险退出”。
+- **突破加仓识别**：20K前高 + 量能确认 + 主升趋势，用于识别分歧转一致后的加速。
+- **持仓成本辅助**：成本可选；只有“浮亏 + 趋势破坏”同时出现时才额外提高风险分，不会仅因浮亏机械止损。
+- **三种策略风格**：稳健 / 均衡 / 进攻。风格主要改变买点、加仓、接回阈值，不弱化风险保护。
+- **数量模型**：买/加/接回按“单次基准股数”；高抛/减仓/风险退出按当前持仓比例并按100股取整。
+- **通知升级**：六类非观察信号达到强度阈值后都可发送 PushPlus / Server酱。
+- **策略沙盒**：即使 AllTick Trial 不能访问自选A股，也可以上传分钟CSV验证V2.3信号。
 
-### 注意
-网页增删自选股会尝试写入当前云端运行目录；Streamlit 重新部署后可能恢复仓库版本。若要长期固定列表，建议把 `WATCHLIST` 写入 Streamlit Secrets，或下载导出的 `watchlist.json` 后再上传到 GitHub。''')
+### 仍然保留 V2.2.3 的保护
+北京时间、API缓存、429退避、604权限状态、Trial安全模式、网页管理自选股和分钟K数据新鲜度保护全部保留。
+
+### 风险说明
+V2.3.0 是规则化研究辅助系统，不会自动下单。分钟级技术信号不能替代基本面、公告、涨跌停、流动性和重大事件判断。''')
 
 if auto and (summary['alltick_configured'] or summary['tushare_configured']):
     time.sleep(refresh)
