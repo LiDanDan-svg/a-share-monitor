@@ -26,6 +26,7 @@ _CONFIG = {
     'tushare_token': '',
     'alltick_interval': 10.5,
     'alltick_access_mode': 'trial',
+    'alltick_batch_size': 5,
 }
 _LAST_ALLTICK_CALL = 0.0
 _TUSHARE_PRO = None
@@ -130,6 +131,7 @@ def configure(
     tushare_token='',
     alltick_interval=10.5,
     alltick_access_mode='trial',
+    alltick_batch_size=5,
 ):
     global _TUSHARE_PRO
     mode = str(alltick_access_mode or 'trial').lower().strip()
@@ -146,6 +148,7 @@ def configure(
         'tushare_token': str(tushare_token or '').strip(),
         'alltick_interval': interval,
         'alltick_access_mode': mode,
+        'alltick_batch_size': max(1, min(50, int(alltick_batch_size or 5))),
     })
     _TUSHARE_PRO = None
 
@@ -158,6 +161,7 @@ def provider_summary():
         'tushare_configured': bool(_CONFIG['tushare_token']),
         'alltick_access_mode': _CONFIG['alltick_access_mode'],
         'alltick_interval': _CONFIG['alltick_interval'],
+        'alltick_batch_size': _CONFIG['alltick_batch_size'],
         'watchlist_scan_enabled': watchlist_scan_enabled(),
     }
 
@@ -407,11 +411,165 @@ def _alltick_post_batch(data_list):
     return _parse_alltick_response(r)
 
 
+
+def _period_to_ktype(period='1'):
+    return {'1': 1, '5': 2, '15': 3, '30': 4, '60': 5}.get(str(period), 1)
+
+
+def _alltick_batch_payload(codes, period='1', query_num=2):
+    ktype = _period_to_ktype(period)
+    return [
+        {
+            'code': code_to_ts(code),
+            'kline_type': ktype,
+            'kline_timestamp_end': 0,
+            'query_kline_num': max(1, min(2, int(query_num))),
+            'adjust_type': 0,
+        }
+        for code in codes
+    ]
+
+
+def _parse_alltick_batch_rows(payload):
+    """兼容 AllTick batch-kline 的几种返回字段命名，返回 {6位代码: rows}."""
+    data = payload.get('data') or {}
+    groups = data.get('kline_list') or data.get('data_list') or data.get('list') or []
+    out = {}
+    if isinstance(groups, dict):
+        groups = [groups]
+    for item in groups or []:
+        if not isinstance(item, dict):
+            continue
+        raw_code = str(item.get('code') or item.get('symbol') or '')
+        m = re.search(r'(\d{6})', raw_code)
+        code = m.group(1) if m else raw_code.split('.')[0].zfill(6)[-6:]
+        rows = item.get('kline_data') or item.get('kline_list') or item.get('data') or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        if code and isinstance(rows, list):
+            out[code] = rows
+    return out
+
+
+def _merge_minute_cache(code, period, base_df, new_rows, source='AllTick批量更新'):
+    latest = normalize_minute(pd.DataFrame(new_rows), keep_days=3)
+    if base_df is None or base_df.empty:
+        merged = latest
+    elif latest.empty:
+        merged = normalize_minute(base_df, keep_days=3)
+    else:
+        merged = normalize_minute(pd.concat([base_df, latest], ignore_index=True), keep_days=3)
+    if not merged.empty:
+        merged.attrs['source'] = source
+        merged.attrs['cached'] = False
+        merged.attrs['fetched_at_cn'] = china_now().strftime('%Y-%m-%d %H:%M:%S')
+        _save_cache(code, period, merged)
+        cache_key = f'minute:alltick:{str(code).zfill(6)}:{period}'
+        _put_cache(cache_key, merged)
+    return merged
+
+
+def _alltick_batch_update_cached(codes, period='1'):
+    """只拉最新2根K线并合并到本地历史缓存。不会重新拉整段历史。"""
+    codes = [str(c).split('.')[0].zfill(6) for c in codes]
+    result, errors = {}, {}
+    batch_size = max(1, int(_CONFIG.get('alltick_batch_size', 5) or 5))
+    for start in range(0, len(codes), batch_size):
+        chunk = codes[start:start + batch_size]
+        try:
+            payload = _alltick_post_batch(_alltick_batch_payload(chunk, period, query_num=2))
+            grouped = _parse_alltick_batch_rows(payload)
+            for code in chunk:
+                base = _load_cache(code, period)
+                rows = grouped.get(code) or []
+                merged = _merge_minute_cache(code, period, base, rows)
+                if not merged.empty:
+                    result[code] = merged
+                else:
+                    errors[code] = 'AllTick批量K线为空。'
+        except Exception as e:
+            msg = friendly_error(e)
+            for code in chunk:
+                base = _load_cache(code, period)
+                if not base.empty:
+                    base.attrs['source'] = 'AllTick历史缓存（批量更新失败）'
+                    base.attrs['cached'] = True
+                    base.attrs['errors'] = msg
+                    result[code] = base
+                else:
+                    errors[code] = msg
+    return result, errors
+
+
+def fetch_watchlist_batch(codes, period='1', bootstrap_budget=2):
+    """V2.5.2 自选池批量更新。
+
+    AllTick：首次每轮最多初始化 bootstrap_budget 只历史K；已有缓存后用 /batch-kline
+    一次更新最多 alltick_batch_size 组，避免每只股票重复拉160根历史K。
+    其他行情源继续走原 fetch_minute 逻辑。
+    """
+    codes = list(dict.fromkeys(str(c).split('.')[0].zfill(6) for c in (codes or [])))
+    frames, errors = {}, {}
+    provider = _resolve_provider(_CONFIG['minute_provider'], purpose='minute')
+    meta = {'provider': provider, 'bootstrapped': [], 'waiting': [], 'batch_requests_est': 0}
+    if not codes:
+        return {'frames': frames, 'errors': errors, 'meta': meta}
+
+    if provider != 'alltick':
+        for code in codes:
+            try:
+                frames[code] = fetch_minute(code, period)
+            except Exception as e:
+                errors[code] = friendly_error(e)
+        return {'frames': frames, 'errors': errors, 'meta': meta}
+
+    if _CONFIG['alltick_access_mode'] == 'trial':
+        msg = 'AllTick试用安全模式：不请求自选A股分钟K。'
+        return {'frames': {}, 'errors': {c: msg for c in codes}, 'meta': meta}
+
+    ready, missing = [], []
+    for code in codes:
+        base = _load_cache(code, period)
+        if len(base) >= 30:
+            ready.append(code)
+            frames[code] = base
+        else:
+            missing.append(code)
+
+    # 首次初始化做预算限制，避免9只股票在一个Streamlit rerun里连续拉9次历史K。
+    budget = max(1, int(bootstrap_budget or 1))
+    bootstrap_now = missing[:budget]
+    waiting = missing[budget:]
+    for code in bootstrap_now:
+        try:
+            df = _fetch_alltick_minute(code, period)
+            df.attrs['source'] = 'AllTick历史初始化'
+            df.attrs['fetched_at_cn'] = china_now().strftime('%Y-%m-%d %H:%M:%S')
+            _save_cache(code, period, df)
+            _put_cache(f'minute:alltick:{code}:{period}', df)
+            frames[code] = df
+            meta['bootstrapped'].append(code)
+        except Exception as e:
+            errors[code] = friendly_error(e)
+    for code in waiting:
+        errors[code] = '等待历史缓存初始化：V2.5.2每轮只初始化少量股票，避免触发AllTick限流。'
+        meta['waiting'].append(code)
+
+    # 只有扫描开始前就已有历史缓存的股票才需要本轮 batch 更新；刚初始化的已经拿到最新K。
+    if ready:
+        updated, batch_errors = _alltick_batch_update_cached(ready, period)
+        frames.update(updated)
+        errors.update(batch_errors)
+        batch_size = max(1, int(_CONFIG.get('alltick_batch_size', 5) or 5))
+        meta['batch_requests_est'] = (len(ready) + batch_size - 1) // batch_size
+
+    return {'frames': frames, 'errors': errors, 'meta': meta}
+
 def _fetch_alltick_minute(code, period='1'):
     if _CONFIG['alltick_access_mode'] == 'trial':
         raise MarketDataError('AllTick试用安全模式：已关闭自选股分钟K请求，避免429/604。升级套餐后把 ALLTICK_ACCESS_MODE 改为 "paid"。', 'trial_block')
     period = str(period)
-    ktype = {'1': 1, '5': 2, '15': 3, '30': 4, '60': 5}.get(period, 1)
+    ktype = _period_to_ktype(period)
     q = {
         'trace': uuid.uuid4().hex,
         'data': {
@@ -484,7 +642,17 @@ def fetch_minute(code, period='1', force=False):
         if provider == 'none':
             continue
         try:
-            out = _fetch_alltick_minute(code, period) if provider == 'alltick' else _fetch_tushare_minute(code, period)
+            if provider == 'alltick':
+                base = _load_cache(code, period)
+                if len(base) >= 30:
+                    updated, batch_errors = _alltick_batch_update_cached([code], period)
+                    out = updated.get(code)
+                    if out is None or out.empty:
+                        raise MarketDataError(batch_errors.get(code, 'AllTick批量更新失败。'), 'batch_failed')
+                else:
+                    out = _fetch_alltick_minute(code, period)
+            else:
+                out = _fetch_tushare_minute(code, period)
             out.attrs['fetched_at_cn'] = china_now().strftime('%Y-%m-%d %H:%M:%S')
             _save_cache(code, period, out)
             _put_cache(cache_key, out)
@@ -545,26 +713,40 @@ def _put_cache(key, value):
     _MEM_CACHE[key] = (time.monotonic(), _copy_df(value) if isinstance(value, pd.DataFrame) else value)
 
 
-def _alltick_index_returns(force=False):
-    # trial/free 只用演示指数验证连通性，不访问用户自选股票。
+def _alltick_index_returns(force=False, allow_remote=True):
+    """V2.5.2：指数最多5分钟刷新一次，并用一次 batch-kline 同时取两只指数。"""
     cache_key = 'alltick_index_returns'
-    if not force:
-        cached = _cached_value(cache_key, ttl=25)
-        if cached is not None:
-            return cached
+    cached = _cached_value(cache_key, ttl=300)
+    if cached is not None and not force:
+        return cached
+    # 扫描优先：需要给自选股让路时，不发指数请求；若有旧缓存则继续使用旧缓存。
+    if not allow_remote:
+        row = _MEM_CACHE.get(cache_key)
+        if row:
+            value = row[1]
+            out = _copy_df(value) if isinstance(value, pd.DataFrame) else value
+            try:
+                out.attrs['stale_market_cache'] = True
+            except Exception:
+                pass
+            return out
+        return pd.DataFrame()
+
+    req = [
+        {'code': '000001.SH', 'kline_type': 8, 'kline_timestamp_end': 0, 'query_kline_num': 2, 'adjust_type': 0},
+        {'code': '399001.SZ', 'kline_type': 8, 'kline_timestamp_end': 0, 'query_kline_num': 2, 'adjust_type': 0},
+    ]
+    payload = _alltick_post_batch(req)
+    grouped = _parse_alltick_batch_rows(payload)
     items = []
-    for code, name in [('000001.SH', '上证指数'), ('399001.SZ', '深证成指')]:
-        q = {
-            'trace': uuid.uuid4().hex,
-            'data': {'code': code, 'kline_type': 8, 'kline_timestamp_end': 0, 'query_kline_num': 2, 'adjust_type': 0},
-        }
-        p = _alltick_get('kline', q)
-        rows = (p.get('data') or {}).get('kline_list') or []
+    for code, name in [('000001', '上证指数'), ('399001', '深证成指')]:
+        rows = grouped.get(code) or []
         if len(rows) >= 2:
-            rows = sorted(rows, key=lambda r: int(r.get('timestamp', 0)))
-            prev = float(rows[-2]['close_price'])
-            cur = float(rows[-1]['close_price'])
-            items.append({'name': name, 'pct': (cur / prev - 1) * 100, 'price': cur})
+            rows = sorted(rows, key=lambda r: int(float(r.get('timestamp', 0) or 0)))
+            prev = float(rows[-2].get('close_price', 0) or 0)
+            cur = float(rows[-1].get('close_price', 0) or 0)
+            if prev > 0 and cur > 0:
+                items.append({'name': name, 'pct': (cur / prev - 1) * 100, 'price': cur})
     out = pd.DataFrame(items)
     out.attrs['fetched_at_cn'] = china_now().strftime('%Y-%m-%d %H:%M:%S')
     _mark_health('alltick', '正常', success=True)
@@ -572,7 +754,7 @@ def _alltick_index_returns(force=False):
     return out
 
 
-def market_regime():
+def market_regime(allow_remote=True):
     status = market_session_status()
     provider = _resolve_provider(_CONFIG['market_provider'], purpose='market')
     if provider == 'none':
@@ -595,16 +777,32 @@ def market_regime():
                 return {'score': 50, 'label': '市场API不可用', 'breadth': None, 'avg_pct': 0.0, 'top': pd.DataFrame(), 'source': 'Tushare', 'status': status, 'error': friendly_error(e)}
     if provider == 'alltick':
         try:
-            idx = _alltick_index_returns()
+            idx = _alltick_index_returns(allow_remote=allow_remote)
             if idx.empty:
+                # 交易扫描优先时不抢额度，没有指数缓存就按中性50处理，不阻塞个股。
+                if not allow_remote:
+                    return {'score': 50, 'label': '中性·待低频更新', 'breadth': None, 'avg_pct': 0.0, 'top': pd.DataFrame(), 'source': '指数低频缓存', 'status': status, 'error': ''}
                 raise MarketDataError('指数数据为空。', 'empty')
             avg = float(idx['pct'].mean())
             score = max(0, min(100, 50 + avg * 8))
             label = '强势' if score >= 70 else '偏强' if score >= 58 else '震荡' if score >= 42 else '偏弱' if score >= 30 else '弱势'
             top = idx.rename(columns={'name': 'code'})[['code', 'pct']].copy()
-            return {'score': round(score, 1), 'label': f'{label}·指数', 'breadth': None, 'avg_pct': round(avg, 2), 'top': top, 'source': 'AllTick大盘指数', 'status': status, 'error': ''}
+            source = 'AllTick指数缓存' if idx.attrs.get('stale_market_cache') else 'AllTick大盘指数·5分钟缓存'
+            return {'score': round(score, 1), 'label': f'{label}·指数', 'breadth': None, 'avg_pct': round(avg, 2), 'top': top, 'source': source, 'status': status, 'error': ''}
         except Exception as e:
-            return {'score': 50, 'label': '指数API不可用', 'breadth': None, 'avg_pct': 0.0, 'top': pd.DataFrame(), 'source': 'AllTick', 'status': status, 'error': friendly_error(e)}
+            return {'score': 50, 'label': '中性·指数暂不可用', 'breadth': None, 'avg_pct': 0.0, 'top': pd.DataFrame(), 'source': 'AllTick', 'status': status, 'error': friendly_error(e)}
+
+
+def refresh_market_cache():
+    """扫描完成后低优先级刷新指数，失败不影响个股结果。"""
+    provider = _resolve_provider(_CONFIG['market_provider'], purpose='market')
+    if provider != 'alltick' or not _CONFIG.get('alltick_token'):
+        return ''
+    try:
+        _alltick_index_returns(force=False, allow_remote=True)
+        return ''
+    except Exception as e:
+        return friendly_error(e)
 
 
 def radar_candidates(limit=30, min_amount=1e8):
